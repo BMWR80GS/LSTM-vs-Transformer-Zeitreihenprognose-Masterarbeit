@@ -49,11 +49,11 @@ MAX_SERIES = 200
 SEQ_LEN = 56
 HORIZON = 28
 
-BATCH_SIZE = 256
+BATCH_SIZE = 512
 MAX_EPOCHS = 10
 
 
-LR = 1e-3
+LR = 3e-3
 LR_SCHEDULER = "plateau"   # nur für Logging/Config
 LR_FACTOR = 0.5            # LR wird mit diesem Faktor multipliziert
 LR_PATIENCE = 5            # Epochen ohne Verbesserung bis Reduktion
@@ -646,7 +646,7 @@ def train_one_seed(
         # Training (MSE im log-space).
         model.train()
         train_losses = []
-        
+
         # non_blocking ist notwendig um den Vorteil von pin_memory=True auszuspielen
         for feature_values, y_log_actual, _series_id, item_idx, store_idx, state_idx in train_loader:
             feature_values = feature_values.to(DEVICE, non_blocking=True)

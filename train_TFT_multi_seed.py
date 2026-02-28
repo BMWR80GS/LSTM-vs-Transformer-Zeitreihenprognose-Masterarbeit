@@ -48,7 +48,6 @@ from pytorch_forecasting.data import GroupNormalizer
 from pytorch_forecasting.metrics import QuantileLoss
 
 from run_logger import (
-    create_run_folder,
     get_system_info,
     save_json,
     save_excel,
