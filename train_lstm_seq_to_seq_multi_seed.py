@@ -649,15 +649,14 @@ def train_one_seed(
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     loss_function = nn.MSELoss()
 
-    # ReduceLROnPlateau Scheduler
-    # Stuerung der LearningRate anhand val_mase. 
+     # ReduceLROnPlateau Scheduler
+    # Steuerung der LearningRate anhand val_mase. 
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode="min",
         factor=LR_FACTOR,
         patience=LR_PATIENCE,
         min_lr=LR_MIN,
-        verbose=True,
     )
 
     # Protokollierung pro Epoche.
