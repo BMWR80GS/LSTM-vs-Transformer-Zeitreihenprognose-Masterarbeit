@@ -646,7 +646,8 @@ def train_one_seed(
         # Training (MSE im log-space).
         model.train()
         train_losses = []
-
+        
+        # non_blocking ist notwendig um den Vorteil von pin_memory=True auszuspielen
         for feature_values, y_log_actual, _series_id, item_idx, store_idx, state_idx in train_loader:
             feature_values = feature_values.to(DEVICE, non_blocking=True)
             y_log_actual = y_log_actual.to(DEVICE, non_blocking=True)

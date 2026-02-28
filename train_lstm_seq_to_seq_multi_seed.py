@@ -372,14 +372,15 @@ def eval_loss_logspace(model: nn.Module, loader: DataLoader) -> float:
     loss_function = nn.MSELoss()
 
     # torch.no_grad() wird genutzt, um die Berechnung der Vorhersagen und des Losses durchzuführen, ohne dass dabei Gradienten berechnet oder gespeichert werden. Dies spart Speicher und Rechenzeit, da wir uns im Evaluierungsmodus befinden und keine Backpropagation durchführen müssen.
+    # non_blocking ist notwendig um den Vorteil von pin_memory=True auszuspielen
     with torch.no_grad():
         for feature_values_enc, feature_values_dec, y_log_actual, _series_id, item_idx, store_idx, state_idx in loader:
-            feature_values_enc = feature_values_enc.to(DEVICE)
-            feature_values_dec = feature_values_dec.to(DEVICE)
-            y_log_actual = y_log_actual.to(DEVICE)
-            item_idx = item_idx.to(DEVICE)
-            store_idx = store_idx.to(DEVICE)
-            state_idx = state_idx.to(DEVICE)
+            feature_values_enc = feature_values_enc.to(DEVICE, non_blocking=True)
+            feature_values_dec = feature_values_dec.to(DEVICE, non_blocking=True)
+            y_log_actual = y_log_actual.to(DEVICE, non_blocking=True)
+            item_idx = item_idx.to(DEVICE, non_blocking=True)
+            store_idx = store_idx.to(DEVICE, non_blocking=True)
+            state_idx = state_idx.to(DEVICE, non_blocking=True)
 
             # Auf Basis der Eingabeinformationen errechnet das Modell die Vorhersagen im log-space. Diese Vorhersagen werden dann mit den tatsächlichen Zielwerten (y_log_actual) verglichen, um den MSE-Loss zu berechnen. Die berechneten Losses werden in einer Liste gesammelt, um am Ende den Durchschnitts-Loss über alle Batches zu ermitteln.
             pred_y_log = model(feature_values_enc, feature_values_dec, item_idx, store_idx, state_idx)
@@ -630,8 +631,8 @@ def train_one_seed(
     )
 
     # Aufbau von DataLoadern für Training und Validierung. Der Trainings-DataLoader wird mit shuffle=True erstellt, um die Reihenfolge der Samples in jedem Epochendurchlauf zu randomisieren, was zu einem robusteren Training führen soll.
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=True)
 
     # Modellinitialisierung.
     # Modell Init
