@@ -453,7 +453,7 @@ def main():
         # CSVLogger wird genutzt, um pro Step/Epoche Metriken in eine Datei zu schreiben.
         csv_logger = CSVLogger(save_dir=str(run_dir), name="lightning_logs")
 
-        # ModelCheckpoint speichert den besten Checkpoint gemäß val_loss.
+        # ModelCheckpoint speichert den besten Checkpoint gemäß val_loss (val_loss = MASE im Log-Space)
         ckpt = ModelCheckpoint(
             dirpath=str(run_dir),
             filename="best",
