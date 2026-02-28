@@ -600,8 +600,8 @@ def train_one_seed(
     )
 
     # Aufbau von DataLoadern für Training und Validierung. Der Trainings-DataLoader wird mit shuffle=True erstellt, um die Reihenfolge der Samples in jedem Epochendurchlauf zu randomisieren, was zu einem robusteren Training führen soll.
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=True)
 
     # Modellinitialisierung.
     n_features = Feature_train.shape[-1]
@@ -648,11 +648,11 @@ def train_one_seed(
         train_losses = []
 
         for feature_values, y_log_actual, _series_id, item_idx, store_idx, state_idx in train_loader:
-            feature_values = feature_values.to(DEVICE)
-            y_log_actual = y_log_actual.to(DEVICE)
-            item_idx = item_idx.to(DEVICE)
-            store_idx = store_idx.to(DEVICE)
-            state_idx = state_idx.to(DEVICE)
+            feature_values = feature_values.to(DEVICE, non_blocking=True)
+            y_log_actual = y_log_actual.to(DEVICE, non_blocking=True)
+            item_idx = item_idx.to(DEVICE, non_blocking=True)
+            store_idx = store_idx.to(DEVICE, non_blocking=True)
+            state_idx = state_idx.to(DEVICE, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
 
