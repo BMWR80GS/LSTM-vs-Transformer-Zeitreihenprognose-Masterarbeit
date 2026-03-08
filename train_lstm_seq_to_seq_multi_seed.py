@@ -5,7 +5,7 @@
 #   vorverarbeiteten M5-Datensatz (Long-Format).
 #
 # Wesentliche Punkte dieser Version:
-#   (1) Autoregressive Zeitreihenfeatures werden aus y_z abgeleitet (nicht aus y_log),
+#   (1) Autoregressive Zeitreihenfeatures werden aus y_log abgeleitet (nicht aus y_log),
 #       um eine konsistente Skalierung der Eingangsvariablen sicherzustellen.
 #       Dies reduziert Optimierungsprobleme durch gemischte Feature-Skalen.
 #
@@ -18,7 +18,7 @@
 # Voraussetzungen:
 #   - data/preprocessed/meta.json
 #   - data/preprocessed/m5_long.csv oder m5_long.parquet
-#   - Spalten: series_id, time_idx, split, y, y_log, y_z sowie exogene Features
+#   - Spalten: series_id, time_idx, split, y, y_log, y_log sowie exogene Features
 # -----------------------------------------------------------------------------
 
 import json
@@ -31,6 +31,9 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
+import optuna
+from optuna.visualization import (plot_optimization_history, plot_param_importances, plot_parallel_coordinate, plot_slice)
+
 from run_logger import (
     get_system_info,
     save_json,
@@ -38,40 +41,57 @@ from run_logger import (
 )
 
 # -----------------------------------------------------------------------------
-# Globale Konfiguration
-# -----------------------------------------------------------------------------
+# Trainingsumfang definieren Start
+
+# Prüfen ob GPU zum Tranining bereitsteht und dies in der DEVICE Variable speichern
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+# Seeds: Anzahl an Traningsläufen mit der identischen Hyperparameterkonfiguration | SEED = Random Initialisierung | NUM_SEEDS = Anzahl an SEEDS (Trainingsläufen)
 SEED = 1
-NUM_SEEDS = 3
+NUM_SEEDS = 1 # Wichtig: Wenn Optuna eingeschaltet ist und damit bereits Optuna mehrere Seeds durchläuft, sind diese Seeds hier nicht nötig. 
+#Für die finalen Runs mit den Hyperparametern wird Optuna ausgeschaltet und dann kann hier NUM_SEEDS wieder zb. auf 3 gestellt werden.
+
+# Wird nur zur Dokumentation genutzt. Anzahl der Serien wird durch Subset bestimmt.
 MAX_SERIES = 200
 
+# Input und Output Sequenzlänge. Modell sieht 56 Tage der Vergangenheit und erstellt eine Prognose für die folgenden 28 Tage
 SEQ_LEN = 56
 HORIZON = 28
 
-BATCH_SIZE = 256
-MAX_EPOCHS = 10
+# Anzahl der maximalen Traingsepochen pro Run (Seed). Wird ggf. durch PATIENCE (Early Stopping) vorher beendet.
+MAX_EPOCHS = 20
+
+# Trainingsumfang definieren Ende
+# -----------------------------------------------------------------------------
 
 
-LR = 1e-3
+# -----------------------------------------------------------------------------
+# Modell-Architektur Konfiguration Start
+
+# Batch Size: Wird so festgelegt, dass die GPU maximal ausgelastet wird um das Training zu beschleunigen.
+BATCH_SIZE = 2560
+
+# Hidden Size: Anzahl der Einheiten (Neuronen) pro verstecktem Layer 
+HIDDEN_SIZE = 256
+
+# LAYER = Anzahl der LSTM-Layer.
+LAYER = 2
+
+# DROPOUT = Dropout zwischen den LSTM-Layern (wirkt nur bei LAYER > 1).
+DROPOUT = 0.1
+
+# Learning Rate und LR-Scheduler 
+LR = 3e-3
 LR_SCHEDULER = "plateau"   # nur für Logging/Config
 LR_FACTOR = 0.5            # LR wird mit diesem Faktor multipliziert
-LR_PATIENCE = 5            # Epochen ohne Verbesserung bis Reduktion
+LR_PATIENCE = 3            # Epochen ohne Verbesserung bis Reduktion
 LR_MIN = 1e-5              # Untergrenze
 
-# -----------------------------------------------------------------------------
-# Modell-Architektur Konfiguration
-# -----------------------------------------------------------------------------
-# Hidden_Size = Anzahl der versteckten Einheiten pro Layer.
-# LAYER = Anzahl der LSTM-Layer.
-# DROPOUT = Dropout zwischen den LSTM-Layern (wirkt nur bei num_layers > 1).
-HIDDEN_SIZE = 128
-LAYER = 2
-DROPOUT = 0.2
-
-# -----------------------------------------------------------------------------
-# Embedding Konfiguration (statische kategoriale Merkmale)
-# -----------------------------------------------------------------------------
+# Early Stopping Konfiguration
+# PATIENCE = Anzahl aufeinanderfolgender Epochen ohne Verbesserung.
+# MIN_DELTA = Mindestverbesserung der Metrik, damit es als echte Verbesserung zählt.
+PATIENCE = 6
+MIN_DELTA = 0.001
 
 # Embedding-Dimensionen für Merkmale, wie Item, Store, State.
 # Die größe der Dimensionen richtet sich grob nach der Anzahl der Kategorien pro Merkmal.
@@ -79,20 +99,26 @@ ITEM_EMB_DIM = 8
 STORE_EMB_DIM = 4
 STATE_EMB_DIM = 2
 
+# Modell-Architektur Konfiguration Ende
 # -----------------------------------------------------------------------------
-# Early Stopping Konfiguration
-# -----------------------------------------------------------------------------
-# PATIENCE = Anzahl aufeinanderfolgender Epochen ohne Verbesserung.
-# MIN_DELTA = Mindestverbesserung der Metrik, damit es als echte Verbesserung zählt.
-PATIENCE = 8
-MIN_DELTA = 0.001
+
+# -------------------------------------------------------------------------
+# Optuna Hyperparameter-Suche
+# -------------------------------------------------------------------------
+# Optuna ist ein Tool, welches zur gezielten Suche der optimalen Hyperparameterkonfiguration genutzt werden kann. 
+# Der Suchraum der Parameter wird in der Funktion 'suggest_hyperparameters' bestimmt.
+USE_OPTUNA = True  # Für die Suche der besten Hyperparameter True, für finale Runs mit festgelegten Parametern False
+OPTUNA_TRIALS = 20 # verschiedene Kombinationen an Parametern
+OPTUNA_TIMEOUT_SEC = None
+OPTUNA_SEEDS_PER_TRIAL = 1 # Jede Parameterkombination wird mit defefinierter Anzahl zufällig im Lösungsraum gestartet, Analog zu NUM_SEEDS
+OPTUNA_DIRECTION = "minimize"  # Lossvalue von val_mase minimieren
+
 
 # -----------------------------------------------------------------------------
 # Pfade
 # -----------------------------------------------------------------------------
 PREP_DIR = Path("data") / "preprocessed"
 CSV_PATH = PREP_DIR / "m5_long.csv"
-PARQUET_PATH = PREP_DIR / "m5_long.parquet"
 META_PATH = PREP_DIR / "meta.json"
 
 RUNS_DIR = Path("runs") / "lstm"
@@ -120,40 +146,40 @@ def load_preprocessed():
     return df
 
 
-def add_autoregressive_features_from_yz(df: pd.DataFrame) -> pd.DataFrame:
-    # Erzeugung autoregressiver Features aus y_z.
-    #
-    # Hintergrund:
-    #   - Das Modell wird im log-space trainiert (y_log), da dies Ausreißer reduziert.
-    #   - Für autoregressive Eingänge ist jedoch y_z vorteilhaft, da es pro Serie z-standardisiert ist
-    #     und somit eine konsistentere Skala besitzt.
-    #
-    # Hinweis:
-    #   Dieser Schritt ist bewusst im Trainingsskript enthalten, damit experimentell nachvollziehbar
-    #   bleibt, welche Feature-Sets im jeweiligen Run genutzt wurden.
+# def add_autoregressive_features_from_yz(df: pd.DataFrame) -> pd.DataFrame:
+#     # Erzeugung autoregressiver Features aus y_log.
+#     #
+#     # Hintergrund:
+#     #   - Das Modell wird im log-space trainiert (y_log), da dies Ausreißer reduziert.
+#     #   - Für autoregressive Eingänge ist jedoch y_log vorteilhaft, da es pro Serie z-standardisiert ist
+#     #     und somit eine konsistentere Skala besitzt.
+#     #
+#     # Hinweis:
+#     #   Dieser Schritt ist bewusst im Trainingsskript enthalten, damit experimentell nachvollziehbar
+#     #   bleibt, welche Feature-Sets im jeweiligen Run genutzt wurden.
 
-    df = df.copy()
+#     df = df.copy()
 
-    LAG_LIST = [7, 14, 28]
-    ROLLING_WINDOWS = [7, 28]
+#     LAG_LIST = [7, 14, 28]
+#     ROLLING_WINDOWS = [7, 28]
 
-    for lag in LAG_LIST:
-        df[f"y_z_lag_{lag}"] = df.groupby("series_id")["y_z"].shift(lag)
+#     for lag in LAG_LIST:
+#         df[f"y_log_lag_{lag}"] = df.groupby("series_id")["y_log"].shift(lag)
 
-    for w in ROLLING_WINDOWS:
-        df[f"y_z_roll_mean_{w}"] = (
-            df.groupby("series_id")["y_z"].shift(1).rolling(w).mean().reset_index(level=0, drop=True)
-        )
-        df[f"y_z_roll_std_{w}"] = (
-            df.groupby("series_id")["y_z"].shift(1).rolling(w).std().reset_index(level=0, drop=True)
-        )
+#     for w in ROLLING_WINDOWS:
+#         df[f"y_log_roll_mean_{w}"] = (
+#             df.groupby("series_id")["y_log"].shift(1).rolling(w).mean().reset_index(level=0, drop=True)
+#         )
+#         df[f"y_log_roll_std_{w}"] = (
+#             df.groupby("series_id")["y_log"].shift(1).rolling(w).std().reset_index(level=0, drop=True)
+#         )
 
-    # Für die ersten Tage je Serie entstehen NaNs durch shift/rolling.
-    # Diese werden mit 0 gefüllt, da die Eingänge z-standardisiert sind und 0 dem Serienmittel entspricht.
-    fill_cols = [c for c in df.columns if c.startswith("y_z_lag_") or c.startswith("y_z_roll_")]
-    df[fill_cols] = df[fill_cols].fillna(0.0).astype(np.float32)
+#     # Für die ersten Tage je Serie entstehen NaNs durch shift/rolling.
+#     # Diese werden mit 0 gefüllt, da die Eingänge z-standardisiert sind und 0 dem Serienmittel entspricht.
+#     fill_cols = [c for c in df.columns if c.startswith("y_log_lag_") or c.startswith("y_log_roll_")]
+#     df[fill_cols] = df[fill_cols].fillna(0.0).astype(np.float32)
 
-    return df
+#     return df
 
 
 def build_feature_columns():
@@ -180,14 +206,14 @@ def build_feature_columns():
         "has_event_2",
     ]
 
-    LAG_LIST = [7, 14, 28]
+    LAG_LIST = [1, 7, 14, 28]
     ROLLING_WINDOWS = [7, 28]
 
     # 2. Encoder Features
-    Encoder_Features = ["y_z"]
-    Encoder_Features += [f"y_z_lag_{l}" for l in LAG_LIST]
-    Encoder_Features += [f"y_z_roll_mean_{w}" for w in ROLLING_WINDOWS]
-    Encoder_Features += [f"y_z_roll_std_{w}" for w in ROLLING_WINDOWS]
+    Encoder_Features = ["y_log"]
+    Encoder_Features += [f"y_log_lag_{l}" for l in LAG_LIST]
+    Encoder_Features += [f"y_log_roll_mean_{w}" for w in ROLLING_WINDOWS]
+    Encoder_Features += [f"y_log_roll_std_{w}" for w in ROLLING_WINDOWS]
 
     # Encoder sieht alles
     enc_cols += Encoder_Features + Decoder_Features
@@ -324,6 +350,7 @@ class Seq_to_Seq_LSTM(nn.Module):
             batch_first=True
         )
 
+        # Das Lineare Layer erzeugt pro Forecastschritt eine Vorhersage. Anders als beim Many-to-One Ansatz bei dem der gesamte Forecasthorizont aus dem letzten Hidden-State erzeugt wird.
         self.fc = nn.Linear(hidden_size, 1)
 
     # Forward-Pass des Modells
@@ -534,7 +561,7 @@ def eval_mase_mse_wape_weekly(model: nn.Module, loader: DataLoader, idx_to_serie
 def ensure_run_dir() -> Path:
     # Erzeugung eines Run-Verzeichnisses mit den wichtigsten Einstellungen im Namen.
     ts = time.strftime("%Y%m%d-%H%M%S")
-    name = (f"{ts}_Seq_to_Seq_seed={SEED}__max_series={MAX_SERIES}__seq_len={SEQ_LEN}__horizon={HORIZON}__batch_size={BATCH_SIZE}__lr={LR}__hidden_size={HIDDEN_SIZE}__patience={PATIENCE}")
+    name = (f"{ts}_Seq_to_Seq_seed={SEED}__max_series={MAX_SERIES}")
     run_dir = RUNS_DIR / name
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
@@ -560,6 +587,75 @@ def build_seed_list() -> list:
     if NUM_SEEDS <= 1:
         return [SEED]
     return [SEED + i for i in range(NUM_SEEDS)]
+
+
+def build_trial_seed_list(trial_base_seed: int, trial_seed_count: int) -> list:
+    if trial_seed_count <= 1:
+        return [trial_base_seed]
+    return [trial_base_seed + i for i in range(trial_seed_count)]
+
+
+def suggest_hyperparameters(optuna_trial: optuna.Trial) -> dict:
+    # Die Parameter Grenzen für Optuna festlegen, in denen nach der optimalen Kombination gesucht wird
+    suggested_hyperparameters = {
+        "learning_rate": optuna_trial.suggest_float("learning_rate", 1e-4, 5e-3, log=True),
+        "hidden_size": optuna_trial.suggest_categorical("hidden_size", [128, 256]),
+        "num_layers": optuna_trial.suggest_categorical("num_layers", [1, 2]),
+        "dropout": optuna_trial.suggest_float("dropout", 0.0, 0.3),
+        "batch_size": optuna_trial.suggest_categorical("batch_size", [1024, 2048]),
+    }
+    return suggested_hyperparameters
+
+# optuna Funktion 
+def objective_factory(
+    df: pd.DataFrame,
+    feature_cols_enc: list,
+    feature_cols_dec: list,
+    series_to_idx: dict,
+    idx_to_series: dict,
+    item_ids: list,
+    store_ids: list,
+    state_ids: list,
+    mase_denoms: dict,
+    optuna_base_dir: Path,
+):
+    def objective(optuna_trial: optuna.Trial) -> float:
+        suggested_hyperparameters = suggest_hyperparameters(optuna_trial)
+
+        trial_run_dir = optuna_base_dir / f"optuna_trial_{optuna_trial.number:04d}"
+        trial_run_dir.mkdir(parents=True, exist_ok=True)
+
+        trial_seed_list = build_trial_seed_list(SEED, OPTUNA_SEEDS_PER_TRIAL)
+
+        validation_mase_values = []
+        for seed_value in trial_seed_list:
+            seed_run_dir = trial_run_dir / f"seed_{seed_value}"
+            seed_run_dir.mkdir(parents=True, exist_ok=True)
+
+            seed_summary = train_one_seed(
+                df=df,
+                feature_cols_enc=feature_cols_enc,
+                feature_cols_dec=feature_cols_dec,
+                series_to_idx=series_to_idx,
+                idx_to_series=idx_to_series,
+                item_ids=item_ids,
+                store_ids=store_ids,
+                state_ids=state_ids,
+                mase_denoms=mase_denoms,
+                run_dir=seed_run_dir,
+                seed_value=seed_value,
+                hpo_params=suggested_hyperparameters,
+            )
+            validation_mase_values.append(float(seed_summary["best_val_mase"]))
+
+        mean_validation_mase = float(np.mean(validation_mase_values)) if validation_mase_values else float("inf")
+
+        optuna_trial.set_user_attr("trial_seeds", trial_seed_list)
+        optuna_trial.set_user_attr("val_mases", validation_mase_values)
+
+        return mean_validation_mase
+
+    return objective
 
 
 def reorder_metrics_columns(metrics_dataframe: pd.DataFrame) -> pd.DataFrame:
@@ -602,9 +698,28 @@ def train_one_seed(
     state_ids: list,
     mase_denoms: dict,
     run_dir: Path,
-    seed_value: int) -> dict:
+    seed_value: int,
+    hpo_params: dict = None) -> dict:
+
+    global LAYER, DROPOUT
     
     set_seed(seed_value)
+
+     # -------------------------------------------------------------
+    # Hyperparameter durch die von Optuna ermittelten überschreiben (wenn Optuna aktiv ist)
+    # -------------------------------------------------------------
+    learning_rate = LR
+    hidden_size = HIDDEN_SIZE
+    num_layers = LAYER
+    dropout_rate = DROPOUT
+    batch_size = BATCH_SIZE
+
+    if hpo_params is not None:
+        learning_rate = float(hpo_params.get("learning_rate", learning_rate))
+        hidden_size = int(hpo_params.get("hidden_size", hidden_size))
+        num_layers = int(hpo_params.get("num_layers", num_layers))
+        dropout_rate = float(hpo_params.get("dropout", dropout_rate))
+        batch_size = int(hpo_params.get("batch_size", batch_size))
 
     # Erzeugung der Sliding Windows über die Funktion build_windows.
     feature_values_enc_train, feature_values_dec_train, Y_log_train, Series_train, Item_train, Store_train, State_train = build_windows(df, "train", series_to_idx, feature_cols_enc, feature_cols_dec)
@@ -798,8 +913,8 @@ def main():
     # Dataframe Laden.
     df = load_preprocessed()
 
-    # Ergänzung der autoregressiven Features auf konsistenter Skala (y_z-basiert).
-    df = add_autoregressive_features_from_yz(df)
+    # Ergänzung der autoregressiven Features auf konsistenter Skala (y_log-basiert).
+    #df = add_autoregressive_features_from_yz(df)
 
     # Zusammenstellung der finalen Feature-Liste.
     feature_cols_enc, feature_cols_dec = build_feature_columns()
@@ -854,6 +969,102 @@ def main():
     # MASE-Denominators werden ausschließlich auf Trainingsdaten berechnet.
     train_df = df[df["split"] == "train"].copy()
     mase_denoms = compute_mase_denominators(train_df, seasonality=7)
+
+    # -----------------------------------------------------------------
+    # Optuna: Hyperparameter Suche
+    # -----------------------------------------------------------------
+    if USE_OPTUNA:
+        optuna_run_dir = run_dir / "optuna"
+        optuna_run_dir.mkdir(parents=True, exist_ok=True)
+
+        objective_function = objective_factory(
+            df=df,
+            feature_cols_enc=feature_cols_dec,
+            feature_cols_dec=feature_cols_dec,
+            series_to_idx=series_to_idx,
+            idx_to_series=idx_to_series,
+            item_ids=item_ids,
+            store_ids=store_ids,
+            state_ids=state_ids,
+            mase_denoms=mase_denoms,
+            optuna_base_dir=optuna_run_dir,
+        )
+
+        optuna_study = optuna.create_study(direction=OPTUNA_DIRECTION)
+        # Optuna startet mit 0 statt 1, daher wird um eins hochgezählt
+        optuna_study.optimize(objective_function, n_trials=OPTUNA_TRIALS+1, timeout=OPTUNA_TIMEOUT_SEC)
+
+        # 1. Verlauf der Objective-Funktion
+        fig1 = plot_optimization_history(optuna_study)
+        fig1.write_html(optuna_run_dir / "optuna_optimization_history.html")
+
+        # 2. Parameter-Wichtigkeit 
+        fig2 = plot_param_importances(optuna_study)
+        fig2.write_html(optuna_run_dir / "optuna_param_importances.html")
+
+        # 3. Parallel-Koordinaten 
+        fig3 = plot_parallel_coordinate(optuna_study)
+        fig3.write_html(optuna_run_dir / "optuna_parallel_coordinate.html")
+
+        # 4. Slice Plot
+        fig4 = plot_slice(optuna_study)
+        fig4.write_html(optuna_run_dir / "optuna_slice.html")
+
+        best_hyperparameters = optuna_study.best_params
+        # save_json(run_dir / "optuna_best_params.json", best_hyperparameters)
+        # save_json(run_dir / "optuna_best_value.json", {"best_value": float(optuna_study.best_value)})
+
+        print("Optuna bester Wert (mean val_mase):", optuna_study.best_value)
+        print("Optuna beste Parameter:", best_hyperparameters)
+
+        seed_list = build_seed_list()
+
+        all_seed_summaries = []
+        best_overall_val_mase = float("inf")
+        best_overall_seed = None
+        best_overall_model_path = None
+
+        for seed_value in seed_list:
+            seed_run_dir = run_dir / f"bestparams_seed_{seed_value}"
+            seed_run_dir.mkdir(parents=True, exist_ok=True)
+
+            seed_summary = train_one_seed(
+                df=df,
+                feature_cols_enc=feature_cols_dec,
+                feature_cols_dec=feature_cols_dec,
+                idx_to_series=idx_to_series,
+                item_ids=item_ids,
+                store_ids=store_ids,
+                state_ids=state_ids,
+                mase_denoms=mase_denoms,
+                run_dir=seed_run_dir,
+                seed_value=seed_value,
+                hpo_params=best_hyperparameters,
+            )
+
+            all_seed_summaries.append(seed_summary)
+
+            if np.isfinite(seed_summary["best_val_mase"]) and seed_summary["best_val_mase"] < best_overall_val_mase:
+                best_overall_val_mase = float(seed_summary["best_val_mase"])
+                best_overall_seed = int(seed_value)
+                best_overall_model_path = Path(seed_summary["best_model_path"])
+
+        overall_summary = {
+            "best_overall_seed": best_overall_seed,
+            "best_overall_val_mase": float(best_overall_val_mase),
+            "seed_summaries": all_seed_summaries,
+            "optuna_best_params": best_hyperparameters,
+            "optuna_best_value": float(optuna_study.best_value),
+        }
+        save_json(run_dir / "overall_summary_bestparams.json", overall_summary)
+
+        if best_overall_model_path is not None and best_overall_model_path.exists():
+            best_target_path = run_dir / f"best_model_overall_bestparams_seed{best_overall_seed}.pt"
+            best_target_path.write_bytes(best_overall_model_path.read_bytes())
+            print("Saved best overall model:", best_target_path)
+
+        print("Saved:", run_dir / "overall_summary_bestparams.json")
+        return
 
     seed_list = build_seed_list()
 

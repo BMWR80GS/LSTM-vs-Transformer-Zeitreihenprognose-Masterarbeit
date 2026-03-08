@@ -40,7 +40,7 @@ SEED = 42
 HORIZON = 28
 
 # Autoregressive Features wie im LSTM-Setup
-LAGS = [1, 7, 28]
+LAGS = [1, 7, 14, 28]
 ROLL_WINDOWS = [7, 28]
 
 
@@ -66,7 +66,7 @@ def log1p_float32(x: pd.Series) -> pd.Series:
 
 
 # ------------------------------------------------------------
-# 1) Rohdaten laden
+# Rohdaten laden
 # ------------------------------------------------------------
 
 # Sicherstellen, dass alle Dateien vorhanden sind
@@ -304,48 +304,47 @@ df["year_s"] = ((df["year"].fillna(y_min).astype(np.float32) - y_min) / denom).a
 #   Hier wird y_log standardisiert (nicht y). Das passt zum Training im Log-Raum
 #   und ist numerisch stabil.
 
-train_only = df[df["split"] == "train"].copy()
+# train_only = df[df["split"] == "train"].copy()
 
-stats = (
-    train_only.groupby("series_id")["y_log"]
-    .agg(["mean", "std"])
-    .rename(columns={"mean": "mu", "std": "sigma"})
-)
+# stats = (
+#     train_only.groupby("series_id")["y_log"]
+#     .agg(["mean", "std"])
+#     .rename(columns={"mean": "mu", "std": "sigma"})
+# )
 
-stats["sigma"] = stats["sigma"].replace(0.0, 1.0).fillna(1.0)
+# stats["sigma"] = stats["sigma"].replace(0.0, 1.0).fillna(1.0)
 
-df = df.merge(stats, on="series_id", how="left")
-df["mu"] = df["mu"].fillna(0.0).astype(np.float32)
-df["sigma"] = df["sigma"].fillna(1.0).astype(np.float32)
+# df = df.merge(stats, on="series_id", how="left")
+# df["mu"] = df["mu"].fillna(0.0).astype(np.float32)
+# df["sigma"] = df["sigma"].fillna(1.0).astype(np.float32)
 
-df["y_z"] = ((df["y_log"] - df["mu"]) / df["sigma"]).astype(np.float32)
+# df["y_z"] = ((df["y_log"] - df["mu"]) / df["sigma"]).astype(np.float32)
 
 
 # ------------------------------------------------------------
-# 14) Autoregressive Features aus y_z (Lags / Rollings)
+# 14) Autoregressive Features aus y_log (Lags / Rollings)
 # ------------------------------------------------------------
 # Hintergrund:
-#   Diese Features wurden zuvor im LSTM-Training erzeugt.
 #   Für einheitliche Datengrundlage werden sie hier bereits im Preprocessing berechnet.
 
 df = df.sort_values(["series_id", "time_idx"]).reset_index(drop=True)
 
 # Lags
 for lag in LAGS:
-    df[f"y_z_lag_{lag}"] = df.groupby("series_id")["y_z"].shift(lag)
+    df[f"y_log_lag_{lag}"] = df.groupby("series_id")["y_log"].shift(lag)
 
 # Rolling (immer nur Vergangenheit -> shift(1))
 for w in ROLL_WINDOWS:
-    shifted = df.groupby("series_id")["y_z"].shift(1)
+    shifted = df.groupby("series_id")["y_log"].shift(1)
 
-    df[f"y_z_roll_mean_{w}"] = (
+    df[f"y_log_roll_mean_{w}"] = (
         shifted.groupby(df["series_id"])
         .rolling(window=w, min_periods=1)
         .mean()
         .reset_index(level=0, drop=True)
     )
 
-    df[f"y_z_roll_std_{w}"] = (
+    df[f"y_log_roll_std_{w}"] = (
         shifted.groupby(df["series_id"])
         .rolling(window=w, min_periods=2)
         .std()
@@ -353,8 +352,8 @@ for w in ROLL_WINDOWS:
     )
 
 # NaNs am Serienanfang neutral auffüllen (0 im standardisierten Raum)
-lag_cols = [f"y_z_lag_{l}" for l in LAGS]
-roll_cols = [f"y_z_roll_mean_{w}" for w in ROLL_WINDOWS] + [f"y_z_roll_std_{w}" for w in ROLL_WINDOWS]
+lag_cols = [f"y_log_lag_{l}" for l in LAGS]
+roll_cols = [f"y_log_roll_mean_{w}" for w in ROLL_WINDOWS] + [f"y_log_roll_std_{w}" for w in ROLL_WINDOWS]
 df[lag_cols + roll_cols] = df[lag_cols + roll_cols].fillna(0.0).astype(np.float32)
 
 
@@ -365,15 +364,15 @@ df[lag_cols + roll_cols] = df[lag_cols + roll_cols].fillna(0.0).astype(np.float3
 keep_cols = [
     "series_id", "time_idx", "date", "split",
     "store_id", "item_id", "dept_id", "cat_id", "state_id",
-    "y", "y_log", "mu", "sigma", "y_z",
+    "y", "y_log",
     "sell_price", "price_s", "price_missing", "snap","wday",
     "wday_s", "month", "month_s", "year_s",
     "has_event_1", "has_event_2",
 ]
 
 keep_cols += lag_cols
-keep_cols += [f"y_z_roll_mean_{w}" for w in ROLL_WINDOWS]
-keep_cols += [f"y_z_roll_std_{w}" for w in ROLL_WINDOWS]
+keep_cols += [f"y_log_roll_mean_{w}" for w in ROLL_WINDOWS]
+keep_cols += [f"y_log_roll_std_{w}" for w in ROLL_WINDOWS]
 
 df = df[keep_cols].copy()
 
@@ -383,29 +382,12 @@ df = df[keep_cols].copy()
 # ------------------------------------------------------------
 
 out_csv = OUT_DIR / "m5_long.csv"
-out_meta = OUT_DIR / "meta.json"
-
 df.to_csv(out_csv, index=False)
 
-meta = {
-    "seed": SEED,
-    "max_series_requested": MAX_SERIES,
-    "series_kept_after_length_filter": kept_series,
-    "horizon": HORIZON,
-    "lags": LAGS,
-    "rolling_windows": ROLL_WINDOWS,
-    "notes": (
-        "Step-by-step preprocessing: melt -> calendar join -> price join -> "
-        "types/NaNs -> per-series splits -> transforms (y_log, price_s) -> "
-        "calendar scaling -> train-only y_z -> y_z lags/rollings -> save."
-    )
-}
-
-with open(out_meta, "w", encoding="utf-8") as f:
-    json.dump(meta, f, ensure_ascii=False, indent=2)
+# with open(out_meta, "w", encoding="utf-8") as f:
+#     json.dump(meta, f, ensure_ascii=False, indent=2)
 
 print("Saved:", str(out_csv))
-print("Meta :", str(out_meta))
 print("Rows:", len(df), "Series:", df["series_id"].nunique())
 print("Date range:", str(df["date"].min()), "->", str(df["date"].max()))
 print("Split counts:\n", df["split"].value_counts())

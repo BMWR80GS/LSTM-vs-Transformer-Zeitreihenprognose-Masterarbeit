@@ -1,4 +1,4 @@
-# train_tft_logged.py
+# train_TFT_multi_seed.py
 # -----------------------------------------------------------------------------
 # Zweck dieses Skripts:
 #   Training eines Temporal Fusion Transformers (TFT) mittels PyTorch Forecasting.
@@ -60,8 +60,6 @@ from run_logger import (
 PROCESSED_DIR = Path("data/preprocessed")
 META_PATH = PROCESSED_DIR / "meta.json"
 CSV_PATH = PROCESSED_DIR / "m5_long.csv"
-PARQUET_PATH = PROCESSED_DIR / "m5_long.parquet"
-
 RUNS_DIR = "runs"
 
 # -----------------------------------------------------------------------------
@@ -70,13 +68,13 @@ RUNS_DIR = "runs"
 ENCODER_LEN = 56
 PRED_LEN = 28
 
-BATCH_SIZE = 64
-MAX_EPOCHS = 5
+BATCH_SIZE = 2560
+MAX_EPOCHS = 1
 
 BASE_SEED = 1
-NUM_SEEDS = 1
+NUM_SEEDS = 3
 
-LR = 3e-4
+LR = 5e-4
 HIDDEN_SIZE = 32
 ATTN_HEAD_SIZE = 4
 HIDDEN_CONT_SIZE = 16
@@ -103,12 +101,10 @@ def load_preprocessed():
 
     meta = json.loads(META_PATH.read_text(encoding="utf-8"))
 
-    if meta.get("output_format") == "parquet" and PARQUET_PATH.exists():
-        df = pd.read_parquet(PARQUET_PATH)
-    elif CSV_PATH.exists():
+    if CSV_PATH.exists():
         df = pd.read_csv(CSV_PATH, parse_dates=["date"])
     else:
-        raise FileNotFoundError("Keine vorverarbeitete Datei gefunden (m5_long.csv oder m5_long.parquet).")
+        raise FileNotFoundError("Keine vorverarbeitete Datei gefunden (m5_long.csv).")
 
     return df, meta
 
@@ -433,9 +429,9 @@ def main():
         series_mapping = get_series_id_mapping(training_ds)
 
         # num_workers=0 ist unter Windows häufig stabiler.
-        train_loader = training_ds.to_dataloader(train=True, batch_size=BATCH_SIZE, num_workers=0)
-        val_loader = val_ds.to_dataloader(train=False, batch_size=BATCH_SIZE, num_workers=0)
-        test_loader = test_ds.to_dataloader(train=False, batch_size=BATCH_SIZE, num_workers=0)
+        train_loader = training_ds.to_dataloader(train=True, batch_size=BATCH_SIZE, num_workers=1, persistent_workers=True )
+        val_loader = val_ds.to_dataloader(train=False, batch_size=BATCH_SIZE,  num_workers=1, persistent_workers=True)
+        test_loader = test_ds.to_dataloader(train=False, batch_size=BATCH_SIZE, num_workers=1, persistent_workers=True)
 
         model = TemporalFusionTransformer.from_dataset(
             training_ds,
@@ -444,9 +440,9 @@ def main():
             attention_head_size=ATTN_HEAD_SIZE,
             hidden_continuous_size=HIDDEN_CONT_SIZE,
             dropout=DROPOUT,
-            loss=QuantileLoss(),
+            loss=QuantileLoss(quantiles=[0.1, 0.5, 0.9]),  # Versuch zur Beschleunigung der Geschwindigkeit -> standardmäßig 7 Quantile (0.02, 0.1, 0.25, 0.5, 0.75, 0.9, 0.98)
             log_interval=10,
-            reduce_on_plateau_patience=2,
+            reduce_on_plateau_patience=3,
         )
 
         # CSVLogger wird genutzt, um pro Step/Epoche Metriken in eine Datei zu schreiben.
@@ -472,11 +468,13 @@ def main():
             max_epochs=MAX_EPOCHS,
             accelerator=DEVICE,
             devices=1,
+            precision="bf16-mixed",  # Mixed Precision reduziert die Datentypen auf Float16 statt Float32 und nutzt so die Architektur der NVIDA GPU optimal aus
             gradient_clip_val=0.1,
             logger=csv_logger,
             callbacks=[ckpt, early],
-            log_every_n_steps=10,
-            enable_progress_bar=True,
+            log_every_n_steps=70,
+            enable_progress_bar=False, # bringt etwa 20% schnellere Trainingszeit, wenn ausgeschaltet
+            profiler="Simple",
         )
 
         total_start = time.time()
@@ -487,10 +485,10 @@ def main():
         if best_path:
             model = TemporalFusionTransformer.load_from_checkpoint(best_path)
 
-        save_forecast_example(model, test_loader, run_dir / "forecast_example.png")
+        #save_forecast_example(model, test_loader, run_dir / "forecast_example.png")
 
         # Lightning erzeugt eine metrics.csv, die train_loss/val_loss enthält.
-        metrics_csv = Path(run_dir) / "lightning_logs" / "version_0" / "metrics.csv"
+        metrics_csv = Path(run_dir) / "metrics.csv"
         epoch_rows = []
 
         if metrics_csv.exists():
@@ -589,7 +587,7 @@ def main():
 
         save_json(run_dir / "summary.json", summary)
         save_excel(run_dir, seed_config, epoch_rows, summary)
-        save_plots(run_dir, epoch_rows)
+        #save_plots(run_dir, epoch_rows)
 
         if np.isfinite(summary["val_mase"]) and summary["val_mase"] < best_overall_val_mase:
             best_overall_val_mase = float(summary["val_mase"])
@@ -605,8 +603,8 @@ def main():
                     best_overall_ckpt.write_bytes(Path(best_path).read_bytes())
 
         print("Saved:", run_dir / "metrics.xlsx")
-        print("Saved plots:", run_dir / "loss.png", run_dir / "metrics.png")
-        print("Saved forecast example:", run_dir / "forecast_example.png")
+        #print("Saved plots:", run_dir / "loss.png", run_dir / "metrics.png")
+        #print("Saved forecast example:", run_dir / "forecast_example.png")
         print("Best checkpoint:", best_path)
 
     save_json(parent_run_dir / "best_overall.json", {
