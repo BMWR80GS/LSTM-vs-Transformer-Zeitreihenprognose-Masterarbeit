@@ -39,6 +39,9 @@ import matplotlib.pyplot as plt
 import torch
 torch.set_float32_matmul_precision("medium")
 
+import optuna
+from optuna.visualization import (plot_optimization_history, plot_param_importances, plot_parallel_coordinate, plot_slice)
+
 import lightning.pytorch as pl
 from lightning.pytorch.loggers import CSVLogger
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
@@ -58,29 +61,34 @@ from run_logger import (
 # Pfade zum vorverarbeiteten Datensatz.
 # -----------------------------------------------------------------------------
 PROCESSED_DIR = Path("data/preprocessed")
-META_PATH = PROCESSED_DIR / "meta.json"
 CSV_PATH = PROCESSED_DIR / "m5_long.csv"
-PARQUET_PATH = PROCESSED_DIR / "m5_long.parquet"
-
 RUNS_DIR = "runs"
 
 # -----------------------------------------------------------------------------
 # Hyperparameter.
 # -----------------------------------------------------------------------------
+MAX_SERIES = 200
+
 ENCODER_LEN = 56
 PRED_LEN = 28
 
-BATCH_SIZE = 64
-MAX_EPOCHS = 5
+BATCH_SIZE = 2048
+MAX_EPOCHS = 1
 
 BASE_SEED = 1
 NUM_SEEDS = 1
 
-LR = 3e-4
+LR = 5e-4
 HIDDEN_SIZE = 32
 ATTN_HEAD_SIZE = 4
 HIDDEN_CONT_SIZE = 16
 DROPOUT = 0.1
+
+USE_OPTUNA = True
+OPTUNA_TRIALS = 2
+OPTUNA_TIMEOUT_SEC = None
+OPTUNA_SEEDS_PER_TRIAL = 1
+OPTUNA_DIRECTION = "minimize"
 
 # -----------------------------------------------------------------------------
 # Early Stopping Einstellungen für TFT (über Lightning Callback).
@@ -98,19 +106,13 @@ DEVICE = "gpu" if torch.cuda.is_available() else "cpu"
 
 def load_preprocessed():
     # Laden des vorverarbeiteten Datensatzes.
-    if not META_PATH.exists():
-        raise FileNotFoundError(f"{META_PATH} fehlt. Preprocessing muss zuvor ausgeführt werden.")
 
-    meta = json.loads(META_PATH.read_text(encoding="utf-8"))
-
-    if meta.get("output_format") == "parquet" and PARQUET_PATH.exists():
-        df = pd.read_parquet(PARQUET_PATH)
-    elif CSV_PATH.exists():
+    if CSV_PATH.exists():
         df = pd.read_csv(CSV_PATH, parse_dates=["date"])
     else:
-        raise FileNotFoundError("Keine vorverarbeitete Datei gefunden (m5_long.csv oder m5_long.parquet).")
+        raise FileNotFoundError("Keine vorverarbeitete Datei gefunden (m5_long.csv).")
 
-    return df, meta
+    return df
 
 
 def add_time_series_features(df):
@@ -281,10 +283,10 @@ def build_timeseries_datasets(df):
     val_cutoff = train_cutoff + PRED_LEN
     test_cutoff = val_cutoff + PRED_LEN
 
-    # Zeitvariierende bekannte Features (auch in der Zukunft verfügbar).
     known_reals = [
         "time_idx",
         "price_s",
+        "price_missing",
         "snap",
         "wday_s",
         "month_s",
@@ -293,8 +295,6 @@ def build_timeseries_datasets(df):
         "has_event_2",
     ]
 
-    # Zeitvariierende unbekannte Features (aus Vergangenheit bekannt, in Zukunft unbekannt).
-    # Neben y_log werden hier zusätzlich Lag- und Rolling-Features aufgenommen.
     unknown_reals = ["y_log"]
     unknown_reals += [f"y_log_lag_{l}" for l in LAG_LIST]
     unknown_reals += [f"y_log_roll_mean_{w}" for w in ROLLING_WINDOWS]
@@ -304,17 +304,13 @@ def build_timeseries_datasets(df):
         time_idx="time_idx",
         target="y_log",
         group_ids=["series_id"],
-
         min_encoder_length=ENCODER_LEN,
         max_encoder_length=ENCODER_LEN,
         min_prediction_length=PRED_LEN,
         max_prediction_length=PRED_LEN,
-
         time_varying_known_reals=known_reals,
         time_varying_unknown_reals=unknown_reals,
-
         target_normalizer=GroupNormalizer(groups=["series_id"]),
-
         add_relative_time_idx=True,
         add_target_scales=True,
         add_encoder_length=True,
@@ -349,8 +345,6 @@ def save_forecast_example(model, test_loader, out_path):
     x = raw.x
     true = x["decoder_target"].detach().cpu().numpy()
 
-    # QuantileLoss erzeugt typischerweise mehrere Quantile.
-    # Der Median wird als Punktprognose verwendet.
     if preds.ndim == 3 and preds.shape[2] > 1:
         preds = preds[:, :, preds.shape[2] // 2]
     elif preds.ndim == 3:
@@ -372,10 +366,271 @@ def save_forecast_example(model, test_loader, out_path):
     plt.close()
 
 
-def main():
-    df, meta = load_preprocessed()
+def build_seed_list() -> list:
+    if NUM_SEEDS <= 1:
+        return [BASE_SEED]
+    return [BASE_SEED + i for i in range(NUM_SEEDS)]
 
-    # Ergänzung autoregressiver Features (Lags/Rolling) analog zum LSTM.
+
+def build_trial_seed_list(trial_base_seed: int, trial_seed_count: int) -> list:
+    if trial_seed_count <= 1:
+        return [trial_base_seed]
+    return [trial_base_seed + i for i in range(trial_seed_count)]
+
+
+def suggest_hyperparameters(optuna_trial: optuna.Trial) -> dict:
+    suggested_hyperparameters = {
+        "learning_rate": optuna_trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True),
+        "hidden_size": optuna_trial.suggest_categorical("hidden_size", [16, 32]),
+        "attention_head_size": optuna_trial.suggest_categorical("attention_head_size", [1, 2, 4]),
+        "hidden_continuous_size": optuna_trial.suggest_categorical("hidden_continuous_size", [8, 16, 32]),
+        "dropout": optuna_trial.suggest_float("dropout", 0.0, 0.3),
+        "batch_size": optuna_trial.suggest_categorical("batch_size", [BATCH_SIZE]),
+    }
+    return suggested_hyperparameters
+
+
+def objective_factory(
+    df: pd.DataFrame,
+    mase_denoms: dict,
+    optuna_base_dir: Path,
+):
+    def objective(optuna_trial: optuna.Trial) -> float:
+        suggested_hyperparameters = suggest_hyperparameters(optuna_trial)
+
+        trial_run_dir = optuna_base_dir / f"optuna_trial_{optuna_trial.number:04d}"
+        trial_run_dir.mkdir(parents=True, exist_ok=True)
+
+        trial_seed_list = build_trial_seed_list(BASE_SEED, OPTUNA_SEEDS_PER_TRIAL)
+
+        validation_mase_values = []
+        for seed_value in trial_seed_list:
+            seed_run_dir = trial_run_dir / f"seed_{seed_value}"
+            seed_run_dir.mkdir(parents=True, exist_ok=True)
+
+            seed_summary = train_one_seed(
+                df=df,
+                mase_denoms=mase_denoms,
+                run_dir=seed_run_dir,
+                seed_value=seed_value,
+                hpo_params=suggested_hyperparameters,
+            )
+            validation_mase_values.append(float(seed_summary["val_mase"]))
+
+        mean_validation_mase = float(np.mean(validation_mase_values)) if validation_mase_values else float("inf")
+
+        optuna_trial.set_user_attr("trial_seeds", trial_seed_list)
+        optuna_trial.set_user_attr("val_mases", validation_mase_values)
+
+        return mean_validation_mase
+
+    return objective
+
+
+def train_one_seed(
+    df: pd.DataFrame,
+    mase_denoms: dict,
+    run_dir: Path,
+    seed_value: int,
+    hpo_params: dict = None,
+) -> dict:
+    learning_rate = LR
+    hidden_size = HIDDEN_SIZE
+    attention_head_size = ATTN_HEAD_SIZE
+    hidden_continuous_size = HIDDEN_CONT_SIZE
+    dropout_rate = DROPOUT
+    batch_size = BATCH_SIZE
+
+    if hpo_params is not None:
+        learning_rate = float(hpo_params.get("learning_rate", learning_rate))
+        hidden_size = int(hpo_params.get("hidden_size", hidden_size))
+        attention_head_size = int(hpo_params.get("attention_head_size", attention_head_size))
+        hidden_continuous_size = int(hpo_params.get("hidden_continuous_size", hidden_continuous_size))
+        dropout_rate = float(hpo_params.get("dropout", dropout_rate))
+        batch_size = int(hpo_params.get("batch_size", batch_size))
+
+    pl.seed_everything(seed_value, workers=False)
+
+    seed_config = {
+        "model": "TFT",
+        "encoder_len": ENCODER_LEN,
+        "pred_len": PRED_LEN,
+        "batch_size": batch_size,
+        "lr": learning_rate,
+        "hidden_size": hidden_size,
+        "attn_head_size": attention_head_size,
+        "hidden_cont_size": hidden_continuous_size,
+        "dropout": dropout_rate,
+        "max_epochs": MAX_EPOCHS,
+        "patience": PATIENCE,
+        "lags": LAG_LIST,
+        "rolling_windows": ROLLING_WINDOWS,
+        "max_series": MAX_SERIES,
+        "device": DEVICE,
+        "base_seed": BASE_SEED,
+        "num_seeds": NUM_SEEDS,
+        "seed": int(seed_value),
+    }
+
+    save_json(run_dir / "config.json", seed_config)
+    save_json(run_dir / "system_info.json", get_system_info())
+
+    training_ds, val_ds, test_ds = build_timeseries_datasets(df)
+    series_mapping = get_series_id_mapping(training_ds)
+
+    train_loader = training_ds.to_dataloader(train=True, batch_size=batch_size, num_workers=1, persistent_workers=True)
+    val_loader = val_ds.to_dataloader(train=False, batch_size=batch_size, num_workers=1, persistent_workers=True)
+    test_loader = test_ds.to_dataloader(train=False, batch_size=batch_size, num_workers=1, persistent_workers=True)
+
+    model = TemporalFusionTransformer.from_dataset(
+        training_ds,
+        learning_rate=learning_rate,
+        hidden_size=hidden_size,
+        attention_head_size=attention_head_size,
+        hidden_continuous_size=hidden_continuous_size,
+        dropout=dropout_rate,
+        loss=QuantileLoss(quantiles=[0.1, 0.5, 0.9]),
+        log_interval=10,
+        reduce_on_plateau_patience=3,
+    )
+
+    csv_logger = CSVLogger(save_dir=str(run_dir), name="lightning_logs")
+
+    ckpt = ModelCheckpoint(
+        dirpath=str(run_dir),
+        filename="best",
+        monitor="val_loss",
+        save_top_k=1,
+        mode="min",
+    )
+
+    early = EarlyStopping(
+        monitor="val_loss",
+        patience=PATIENCE,
+        mode="min",
+    )
+
+    trainer = pl.Trainer(
+        max_epochs=MAX_EPOCHS,
+        accelerator=DEVICE,
+        devices=1,
+        precision="bf16-mixed",
+        gradient_clip_val=0.1,
+        logger=csv_logger,
+        callbacks=[ckpt, early],
+        log_every_n_steps=70,
+        enable_progress_bar=False,
+        profiler="Simple",
+    )
+
+    total_start = time.time()
+    trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
+    total_time = time.time() - total_start
+
+    best_path = ckpt.best_model_path
+    if best_path:
+        model = TemporalFusionTransformer.load_from_checkpoint(best_path)
+
+    metrics_csv = Path(csv_logger.log_dir) / "metrics.csv"
+    epoch_rows = []
+
+    if metrics_csv.exists():
+        log_df = pd.read_csv(metrics_csv)
+        epochs = sorted(log_df["epoch"].dropna().unique().tolist())
+        for ep in epochs:
+            ep = int(ep)
+            sub = log_df[log_df["epoch"] == ep]
+
+            train_loss = np.nan
+            val_loss = np.nan
+
+            if "train_loss" in sub.columns:
+                tmp = sub["train_loss"].dropna()
+                if len(tmp) > 0:
+                    train_loss = float(tmp.iloc[-1])
+
+            if "val_loss" in sub.columns:
+                tmp = sub["val_loss"].dropna()
+                if len(tmp) > 0:
+                    val_loss = float(tmp.iloc[-1])
+
+            epoch_rows.append({
+                "epoch": ep + 1,
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+            })
+
+    val_raw = model.predict(val_loader, mode="raw", return_x=True)
+    val_preds = val_raw.output.prediction.detach().cpu().numpy()
+    val_x = val_raw.x
+    val_true = val_x["decoder_target"].detach().cpu().numpy()
+
+    if val_preds.ndim == 3 and val_preds.shape[2] > 1:
+        val_preds = val_preds[:, :, val_preds.shape[2] // 2]
+    elif val_preds.ndim == 3:
+        val_preds = val_preds[:, :, 0]
+
+    val_pred_y = np.expm1(val_preds).clip(min=0.0)
+    val_true_y = np.expm1(val_true).clip(min=0.0)
+
+    val_series_ids = extract_series_ids_from_raw_x(val_x, series_mapping)
+    val_metrics = eval_mase_mse_wape_weekly_from_arrays(val_pred_y, val_true_y, val_series_ids, mase_denoms)
+
+    test_raw = model.predict(test_loader, mode="raw", return_x=True)
+    test_preds = test_raw.output.prediction.detach().cpu().numpy()
+    test_x = test_raw.x
+    test_true = test_x["decoder_target"].detach().cpu().numpy()
+
+    if test_preds.ndim == 3 and test_preds.shape[2] > 1:
+        test_preds = test_preds[:, :, test_preds.shape[2] // 2]
+    elif test_preds.ndim == 3:
+        test_preds = test_preds[:, :, 0]
+
+    test_pred_y = np.expm1(test_preds).clip(min=0.0)
+    test_true_y = np.expm1(test_true).clip(min=0.0)
+
+    test_series_ids = extract_series_ids_from_raw_x(test_x, series_mapping)
+    test_metrics = eval_mase_mse_wape_weekly_from_arrays(test_pred_y, test_true_y, test_series_ids, mase_denoms)
+
+    summary = {
+        "seed": int(seed_value),
+        "best_model_path": best_path,
+        "best_val_loss": float(ckpt.best_model_score) if ckpt.best_model_score is not None else None,
+        "total_time_sec": float(total_time),
+        "epochs_ran": int(trainer.current_epoch) + 1,
+        "val_mase": float(val_metrics["mase"]),
+        "val_mase_w1": float(val_metrics["mase_w1"]),
+        "val_mase_w2": float(val_metrics["mase_w2"]),
+        "val_mase_w3": float(val_metrics["mase_w3"]),
+        "val_mase_w4": float(val_metrics["mase_w4"]),
+        "val_wape": float(val_metrics["wape"]),
+        "val_wape_w1": float(val_metrics["wape_w1"]),
+        "val_wape_w2": float(val_metrics["wape_w2"]),
+        "val_wape_w3": float(val_metrics["wape_w3"]),
+        "val_wape_w4": float(val_metrics["wape_w4"]),
+        "test_mase": float(test_metrics["mase"]),
+        "test_mase_w1": float(test_metrics["mase_w1"]),
+        "test_mase_w2": float(test_metrics["mase_w2"]),
+        "test_mase_w3": float(test_metrics["mase_w3"]),
+        "test_mase_w4": float(test_metrics["mase_w4"]),
+        "test_wape": float(test_metrics["wape"]),
+        "test_wape_w1": float(test_metrics["wape_w1"]),
+        "test_wape_w2": float(test_metrics["wape_w2"]),
+        "test_wape_w3": float(test_metrics["wape_w3"]),
+        "test_wape_w4": float(test_metrics["wape_w4"]),
+    }
+
+    save_json(run_dir / "summary.json", summary)
+    save_excel(run_dir, seed_config, epoch_rows, summary)
+
+    print("Saved:", run_dir / "metrics.xlsx")
+    print("Best checkpoint:", best_path)
+
+    return summary
+
+
+def main():
+    df = load_preprocessed()
     df = add_time_series_features(df)
 
     train_df = df[df["split"] == "train"].copy()
@@ -395,219 +650,137 @@ def main():
         "patience": PATIENCE,
         "lags": LAG_LIST,
         "rolling_windows": ROLLING_WINDOWS,
-        "max_series": meta.get("max_series_requested"),
-        "series_kept": meta.get("series_kept_after_length_filter"),
+        "max_series": MAX_SERIES,
         "device": DEVICE,
         "base_seed": BASE_SEED,
         "num_seeds": NUM_SEEDS,
+        "use_optuna": USE_OPTUNA,
+        "optuna_trials": OPTUNA_TRIALS,
+        "optuna_timeout_sec": OPTUNA_TIMEOUT_SEC,
+        "optuna_seeds_per_trial": OPTUNA_SEEDS_PER_TRIAL,
+        "optuna_direction": OPTUNA_DIRECTION,
     }
 
     ts = time.strftime("%Y%m%d-%H%M%S")
-    parent_run_dir = Path(RUNS_DIR) / "tft" / f"{ts}_MultiSeed_TFT__base_seed={BASE_SEED}__num_seeds={NUM_SEEDS}"
+    parent_run_dir = Path(RUNS_DIR) / "tft" / f"{ts}TFT__base_seed={BASE_SEED}__num_seeds={NUM_SEEDS}"
     parent_run_dir.mkdir(parents=True, exist_ok=True)
 
     save_json(parent_run_dir / "config.json", config)
     save_json(parent_run_dir / "system_info.json", get_system_info())
+
+    if USE_OPTUNA:
+        optuna_run_dir = parent_run_dir / "optuna"
+        optuna_run_dir.mkdir(parents=True, exist_ok=True)
+
+        objective_function = objective_factory(
+            df=df,
+            mase_denoms=mase_denoms,
+            optuna_base_dir=optuna_run_dir,
+        )
+
+        optuna_study = optuna.create_study(direction=OPTUNA_DIRECTION)
+        optuna_study.optimize(objective_function, n_trials=OPTUNA_TRIALS + 1, timeout=OPTUNA_TIMEOUT_SEC)
+
+        fig1 = plot_optimization_history(optuna_study)
+        fig1.write_html(optuna_run_dir / "optuna_optimization_history.html")
+
+        fig2 = plot_param_importances(optuna_study)
+        fig2.write_html(optuna_run_dir / "optuna_param_importances.html")
+
+        fig3 = plot_parallel_coordinate(optuna_study)
+        fig3.write_html(optuna_run_dir / "optuna_parallel_coordinate.html")
+
+        fig4 = plot_slice(optuna_study)
+        fig4.write_html(optuna_run_dir / "optuna_slice.html")
+
+        best_hyperparameters = optuna_study.best_params
+
+        print("Optuna bester Wert (mean val_mase):", optuna_study.best_value)
+        print("Optuna beste Parameter:", best_hyperparameters)
+
+        seed_list = build_seed_list()
+
+        all_seed_summaries = []
+        best_overall_val_mase = float("inf")
+        best_overall_val_loss = float("inf")
+        best_overall_seed = None
+        best_overall_ckpt = parent_run_dir / "best_model_overall_bestparams.ckpt"
+
+        for seed_value in seed_list:
+            seed_run_dir = parent_run_dir / f"bestparams_seed_{seed_value}"
+            seed_run_dir.mkdir(parents=True, exist_ok=True)
+
+            seed_summary = train_one_seed(
+                df=df,
+                mase_denoms=mase_denoms,
+                run_dir=seed_run_dir,
+                seed_value=seed_value,
+                hpo_params=best_hyperparameters,
+            )
+
+            all_seed_summaries.append(seed_summary)
+
+            if np.isfinite(seed_summary["val_mase"]) and seed_summary["val_mase"] < best_overall_val_mase:
+                best_overall_val_mase = float(seed_summary["val_mase"])
+                best_overall_val_loss = float(seed_summary["best_val_loss"]) if seed_summary["best_val_loss"] is not None else float("inf")
+                best_overall_seed = int(seed_value)
+                best_path = seed_summary["best_model_path"]
+                if best_path:
+                    best_overall_ckpt.write_bytes(Path(best_path).read_bytes())
+            elif not np.isfinite(seed_summary["val_mase"]):
+                if seed_summary["best_val_loss"] is not None and float(seed_summary["best_val_loss"]) < best_overall_val_loss:
+                    best_overall_val_loss = float(seed_summary["best_val_loss"])
+                    best_overall_seed = int(seed_value)
+                    best_path = seed_summary["best_model_path"]
+                    if best_path:
+                        best_overall_ckpt.write_bytes(Path(best_path).read_bytes())
+
+        overall_summary = {
+            "best_overall_seed": best_overall_seed,
+            "best_overall_val_mase": float(best_overall_val_mase),
+            "best_overall_val_loss": float(best_overall_val_loss),
+            "best_checkpoint_path": str(best_overall_ckpt),
+            "seed_summaries": all_seed_summaries,
+            "optuna_best_params": best_hyperparameters,
+            "optuna_best_value": float(optuna_study.best_value),
+        }
+        save_json(parent_run_dir / "overall_summary_bestparams.json", overall_summary)
+
+        print("Saved:", parent_run_dir / "overall_summary_bestparams.json")
+        return
+
+    seed_list = build_seed_list()
 
     best_overall_val_mase = float("inf")
     best_overall_val_loss = float("inf")
     best_overall_seed = None
     best_overall_ckpt = parent_run_dir / "best_overall.ckpt"
 
-    for seed_offset in range(NUM_SEEDS):
-        current_seed = int(BASE_SEED) + int(seed_offset)
-
-        # Seed wird für Konsistenz der Experimente gesetzt.
-        pl.seed_everything(current_seed, workers=False)
-
-        run_dir = parent_run_dir / f"seed_{current_seed}"
+    for seed_value in seed_list:
+        run_dir = parent_run_dir / f"seed_{seed_value}"
         run_dir.mkdir(parents=True, exist_ok=True)
 
-        seed_config = dict(config)
-        seed_config["seed"] = current_seed
-        save_json(run_dir / "config.json", seed_config)
-        save_json(run_dir / "system_info.json", get_system_info())
-
-        training_ds, val_ds, test_ds = build_timeseries_datasets(df)
-
-        series_mapping = get_series_id_mapping(training_ds)
-
-        # num_workers=0 ist unter Windows häufig stabiler.
-        train_loader = training_ds.to_dataloader(train=True, batch_size=BATCH_SIZE, num_workers=0)
-        val_loader = val_ds.to_dataloader(train=False, batch_size=BATCH_SIZE, num_workers=0)
-        test_loader = test_ds.to_dataloader(train=False, batch_size=BATCH_SIZE, num_workers=0)
-
-        model = TemporalFusionTransformer.from_dataset(
-            training_ds,
-            learning_rate=LR,
-            hidden_size=HIDDEN_SIZE,
-            attention_head_size=ATTN_HEAD_SIZE,
-            hidden_continuous_size=HIDDEN_CONT_SIZE,
-            dropout=DROPOUT,
-            loss=QuantileLoss(),
-            log_interval=10,
-            reduce_on_plateau_patience=2,
+        summary = train_one_seed(
+            df=df,
+            mase_denoms=mase_denoms,
+            run_dir=run_dir,
+            seed_value=seed_value,
         )
-
-        # CSVLogger wird genutzt, um pro Step/Epoche Metriken in eine Datei zu schreiben.
-        csv_logger = CSVLogger(save_dir=str(run_dir), name="lightning_logs")
-
-        # ModelCheckpoint speichert den besten Checkpoint gemäß val_loss (val_loss = MASE im Log-Space)
-        ckpt = ModelCheckpoint(
-            dirpath=str(run_dir),
-            filename="best",
-            monitor="val_loss",
-            save_top_k=1,
-            mode="min",
-        )
-
-        # EarlyStopping reduziert Overfitting-Risiko und spart Rechenzeit.
-        early = EarlyStopping(
-            monitor="val_loss",
-            patience=PATIENCE,
-            mode="min",
-        )
-
-        trainer = pl.Trainer(
-            max_epochs=MAX_EPOCHS,
-            accelerator=DEVICE,
-            devices=1,
-            gradient_clip_val=0.1,
-            logger=csv_logger,
-            callbacks=[ckpt, early],
-            log_every_n_steps=10,
-            enable_progress_bar=True,
-        )
-
-        total_start = time.time()
-        trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
-        total_time = time.time() - total_start
-
-        best_path = ckpt.best_model_path
-        if best_path:
-            model = TemporalFusionTransformer.load_from_checkpoint(best_path)
-
-        save_forecast_example(model, test_loader, run_dir / "forecast_example.png")
-
-        # Lightning erzeugt eine metrics.csv, die train_loss/val_loss enthält.
-        metrics_csv = Path(run_dir) / "lightning_logs" / "version_0" / "metrics.csv"
-        epoch_rows = []
-
-        if metrics_csv.exists():
-            log_df = pd.read_csv(metrics_csv)
-
-            # Pro Epoche wird der jeweils letzte verfügbare Wert genutzt.
-            # Dies ist pragmatisch, da train_loss häufig pro Step und val_loss pro Epoche geloggt wird.
-            epochs = sorted(log_df["epoch"].dropna().unique().tolist())
-            for ep in epochs:
-                ep = int(ep)
-                sub = log_df[log_df["epoch"] == ep]
-
-                train_loss = np.nan
-                val_loss = np.nan
-
-                if "train_loss" in sub.columns:
-                    tmp = sub["train_loss"].dropna()
-                    if len(tmp) > 0:
-                        train_loss = float(tmp.iloc[-1])
-
-                if "val_loss" in sub.columns:
-                    tmp = sub["val_loss"].dropna()
-                    if len(tmp) > 0:
-                        val_loss = float(tmp.iloc[-1])
-
-                epoch_rows.append({
-                    "epoch": ep + 1,
-                    "train_loss": train_loss,
-                    "val_loss": val_loss,
-                })
-
-        # Zusätzliche Auswertung (MASE/WAPE, auch je Woche) auf Validierung und Test.
-        val_raw = model.predict(val_loader, mode="raw", return_x=True)
-        val_preds = val_raw.output.prediction.detach().cpu().numpy()
-        val_x = val_raw.x
-        val_true = val_x["decoder_target"].detach().cpu().numpy()
-
-        if val_preds.ndim == 3 and val_preds.shape[2] > 1:
-            val_preds = val_preds[:, :, val_preds.shape[2] // 2]
-        elif val_preds.ndim == 3:
-            val_preds = val_preds[:, :, 0]
-
-        val_pred_y = np.expm1(val_preds).clip(min=0.0)
-        val_true_y = np.expm1(val_true).clip(min=0.0)
-
-        val_series_ids = extract_series_ids_from_raw_x(val_x, series_mapping)
-        val_metrics = eval_mase_mse_wape_weekly_from_arrays(val_pred_y, val_true_y, val_series_ids, mase_denoms)
-
-        test_raw = model.predict(test_loader, mode="raw", return_x=True)
-        test_preds = test_raw.output.prediction.detach().cpu().numpy()
-        test_x = test_raw.x
-        test_true = test_x["decoder_target"].detach().cpu().numpy()
-
-        if test_preds.ndim == 3 and test_preds.shape[2] > 1:
-            test_preds = test_preds[:, :, test_preds.shape[2] // 2]
-        elif test_preds.ndim == 3:
-            test_preds = test_preds[:, :, 0]
-
-        test_pred_y = np.expm1(test_preds).clip(min=0.0)
-        test_true_y = np.expm1(test_true).clip(min=0.0)
-
-        test_series_ids = extract_series_ids_from_raw_x(test_x, series_mapping)
-        test_metrics = eval_mase_mse_wape_weekly_from_arrays(test_pred_y, test_true_y, test_series_ids, mase_denoms)
-
-        summary = {
-            "seed": current_seed,
-            "best_model_path": best_path,
-            "best_val_loss": float(ckpt.best_model_score) if ckpt.best_model_score is not None else None,
-            "total_time_sec": float(total_time),
-            "epochs_ran": int(trainer.current_epoch) + 1,
-
-            "val_mase": float(val_metrics["mase"]),
-            "val_mase_w1": float(val_metrics["mase_w1"]),
-            "val_mase_w2": float(val_metrics["mase_w2"]),
-            "val_mase_w3": float(val_metrics["mase_w3"]),
-            "val_mase_w4": float(val_metrics["mase_w4"]),
-
-            "val_wape": float(val_metrics["wape"]),
-            "val_wape_w1": float(val_metrics["wape_w1"]),
-            "val_wape_w2": float(val_metrics["wape_w2"]),
-            "val_wape_w3": float(val_metrics["wape_w3"]),
-            "val_wape_w4": float(val_metrics["wape_w4"]),
-
-            "test_mase": float(test_metrics["mase"]),
-            "test_mase_w1": float(test_metrics["mase_w1"]),
-            "test_mase_w2": float(test_metrics["mase_w2"]),
-            "test_mase_w3": float(test_metrics["mase_w3"]),
-            "test_mase_w4": float(test_metrics["mase_w4"]),
-
-            "test_wape": float(test_metrics["wape"]),
-            "test_wape_w1": float(test_metrics["wape_w1"]),
-            "test_wape_w2": float(test_metrics["wape_w2"]),
-            "test_wape_w3": float(test_metrics["wape_w3"]),
-            "test_wape_w4": float(test_metrics["wape_w4"]),
-        }
-
-        save_json(run_dir / "summary.json", summary)
-        save_excel(run_dir, seed_config, epoch_rows, summary)
-        save_plots(run_dir, epoch_rows)
 
         if np.isfinite(summary["val_mase"]) and summary["val_mase"] < best_overall_val_mase:
             best_overall_val_mase = float(summary["val_mase"])
             best_overall_val_loss = float(summary["best_val_loss"]) if summary["best_val_loss"] is not None else float("inf")
-            best_overall_seed = int(current_seed)
+            best_overall_seed = int(seed_value)
+            best_path = summary["best_model_path"]
             if best_path:
                 best_overall_ckpt.write_bytes(Path(best_path).read_bytes())
         elif not np.isfinite(summary["val_mase"]):
             if summary["best_val_loss"] is not None and float(summary["best_val_loss"]) < best_overall_val_loss:
                 best_overall_val_loss = float(summary["best_val_loss"])
-                best_overall_seed = int(current_seed)
+                best_overall_seed = int(seed_value)
+                best_path = summary["best_model_path"]
                 if best_path:
                     best_overall_ckpt.write_bytes(Path(best_path).read_bytes())
-
-        print("Saved:", run_dir / "metrics.xlsx")
-        print("Saved plots:", run_dir / "loss.png", run_dir / "metrics.png")
-        print("Saved forecast example:", run_dir / "forecast_example.png")
-        print("Best checkpoint:", best_path)
 
     save_json(parent_run_dir / "best_overall.json", {
         "best_seed": best_overall_seed,

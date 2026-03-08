@@ -1,0 +1,21 @@
+# Hilfsbibliotheken und Visualisierung
+numpy
+pandas
+matplotlib
+
+# LSTM
+torch
+
+# Temporal Fusion Transformer
+lightning
+pytorch-forecasting
+
+# Hyperparameter Optimierung
+optuna
+
+# Visualisierung der Optuna Ergebnisse
+plotly
+
+# Einlesen von Excel und CSV
+openpyxl
+

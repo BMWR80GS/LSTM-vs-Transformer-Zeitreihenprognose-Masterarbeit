@@ -106,22 +106,22 @@ def save_json(path, data):
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
-# def save_excel(run_dir, config, epoch_rows, summary):
-#     # Speicherung von Konfiguration, epoch-weisen Metriken und Zusammenfassung in Excel.
-#     # Das Excel-Format erleichtert die Auswertung und die Integration in Berichte.
-#     run_dir = Path(run_dir)
-#     out_path = run_dir / "metrics.xlsx"
+def save_excel(run_dir, config, epoch_rows, summary):
+    # Speicherung von Konfiguration, epoch-weisen Metriken und Zusammenfassung in Excel.
+    # Das Excel-Format erleichtert die Auswertung und die Integration in Berichte.
+    run_dir = Path(run_dir)
+    out_path = run_dir / "metrics.xlsx"
 
-#     df_config = pd.DataFrame([config])
-#     df_epochs = pd.DataFrame(epoch_rows)
-#     df_summary = pd.DataFrame([summary])
+    df_config = pd.DataFrame([config])
+    df_epochs = pd.DataFrame(epoch_rows)
+    df_summary = pd.DataFrame([summary])
 
-#     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
-#         df_config.to_excel(writer, sheet_name="config", index=False)
-#         df_epochs.to_excel(writer, sheet_name="epochs", index=False)
-#         df_summary.to_excel(writer, sheet_name="summary", index=False)
+    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+        df_config.to_excel(writer, sheet_name="config", index=False)
+        df_epochs.to_excel(writer, sheet_name="epochs", index=False)
+        df_summary.to_excel(writer, sheet_name="summary", index=False)
 
-#     return out_path
+    return out_path
 
 
 def save_plots(run_dir, epoch_rows):
@@ -153,26 +153,17 @@ def save_plots(run_dir, epoch_rows):
         plt.savefig(run_dir / "loss.png", dpi=150)
         plt.close()
 
-    # Plot 2: Metriken-Verlauf (MASE/MSE)
-    metric_cols = ["train_mase", "val_mase", "train_mse", "val_mse"]
+    # Plot 2: Metrik-Verlauf (MASE)
+    metric_cols = [ "val_mase"]
     if any(c in df.columns for c in metric_cols):
         plt.figure()
 
-        if "train_mase" in df.columns and df["train_mase"].notna().any():
-            plt.plot(df["epoch"], df["train_mase"], label="train_mase")
-
         if "val_mase" in df.columns and df["val_mase"].notna().any():
-            plt.plot(df["epoch"], df["val_mase"], label="val_mase", linestyle="--")
-
-        if "train_mse" in df.columns and df["train_mse"].notna().any():
-            plt.plot(df["epoch"], df["train_mse"], label="train_mse")
-
-        if "val_mse" in df.columns and df["val_mse"].notna().any():
-            plt.plot(df["epoch"], df["val_mse"], label="val_mse", linestyle="--")
+            plt.plot(df["epoch"], df["val_mase"], label="MASE", linestyle="--")
 
         plt.xlabel("Epoch")
         plt.ylabel("Wert")
-        plt.title("MASE / MSE pro Epoche")
+        plt.title("MASE pro Epoche")
         plt.grid(True)
         plt.legend()
         plt.tight_layout()
