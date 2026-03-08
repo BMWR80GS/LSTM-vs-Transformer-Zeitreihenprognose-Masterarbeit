@@ -480,11 +480,6 @@ def train_one_seed(
 
     save_json(run_dir / "config.json", seed_config)
     save_json(run_dir / "system_info.json", get_system_info())
-        "seed": int(seed_value),
-    }
-
-    save_json(run_dir / "config.json", seed_config)
-    save_json(run_dir / "system_info.json", get_system_info())
 
     training_ds, val_ds, test_ds = build_timeseries_datasets(df)
     series_mapping = get_series_id_mapping(training_ds)
