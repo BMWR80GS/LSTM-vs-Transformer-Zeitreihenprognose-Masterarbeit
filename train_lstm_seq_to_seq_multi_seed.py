@@ -119,7 +119,6 @@ OPTUNA_DIRECTION = "minimize"  # Lossvalue von val_mase minimieren
 # -----------------------------------------------------------------------------
 PREP_DIR = Path("data") / "preprocessed"
 CSV_PATH = PREP_DIR / "m5_long.csv"
-
 RUNS_DIR = Path("runs") / "lstm"
 
 
