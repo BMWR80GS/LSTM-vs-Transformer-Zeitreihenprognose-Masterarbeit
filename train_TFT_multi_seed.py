@@ -461,6 +461,12 @@ def train_one_seed(
         "attn_head_size": attention_head_size,
         "hidden_cont_size": hidden_continuous_size,
         "dropout": dropout_rate,
+        "batch_size": batch_size,
+        "lr": learning_rate,
+        "hidden_size": hidden_size,
+        "attn_head_size": attention_head_size,
+        "hidden_cont_size": hidden_continuous_size,
+        "dropout": dropout_rate,
         "max_epochs": MAX_EPOCHS,
         "patience": PATIENCE,
         "lags": LAG_LIST,
@@ -469,6 +475,11 @@ def train_one_seed(
         "device": DEVICE,
         "base_seed": BASE_SEED,
         "num_seeds": NUM_SEEDS,
+        "seed": int(seed_value),
+    }
+
+    save_json(run_dir / "config.json", seed_config)
+    save_json(run_dir / "system_info.json", get_system_info())
         "seed": int(seed_value),
     }
 
@@ -493,9 +504,27 @@ def train_one_seed(
         log_interval=10,
         reduce_on_plateau_patience=3,
     )
+    model = TemporalFusionTransformer.from_dataset(
+        training_ds,
+        learning_rate=learning_rate,
+        hidden_size=hidden_size,
+        attention_head_size=attention_head_size,
+        hidden_continuous_size=hidden_continuous_size,
+        dropout=dropout_rate,
+        loss=QuantileLoss(quantiles=[0.1, 0.5, 0.9]),
+        log_interval=10,
+        reduce_on_plateau_patience=3,
+    )
 
     csv_logger = CSVLogger(save_dir=str(run_dir), name="lightning_logs")
 
+    ckpt = ModelCheckpoint(
+        dirpath=str(run_dir),
+        filename="best",
+        monitor="val_loss",
+        save_top_k=1,
+        mode="min",
+    )
     ckpt = ModelCheckpoint(
         dirpath=str(run_dir),
         filename="best",
@@ -509,7 +538,24 @@ def train_one_seed(
         patience=PATIENCE,
         mode="min",
     )
+    early = EarlyStopping(
+        monitor="val_loss",
+        patience=PATIENCE,
+        mode="min",
+    )
 
+    trainer = pl.Trainer(
+        max_epochs=MAX_EPOCHS,
+        accelerator=DEVICE,
+        devices=1,
+        precision="bf16-mixed",
+        gradient_clip_val=0.1,
+        logger=csv_logger,
+        callbacks=[ckpt, early],
+        log_every_n_steps=70,
+        enable_progress_bar=False,
+        profiler="Simple",
+    )
     trainer = pl.Trainer(
         max_epochs=MAX_EPOCHS,
         accelerator=DEVICE,

@@ -139,7 +139,7 @@ def load_preprocessed():
     else:
         raise FileNotFoundError("Keine preprocessed Datei gefunden (m5_long.csv).")
 
-    return df
+#     return df
 
 
 def build_feature_columns():
