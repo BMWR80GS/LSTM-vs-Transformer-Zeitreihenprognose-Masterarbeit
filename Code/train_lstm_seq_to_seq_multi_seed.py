@@ -107,7 +107,7 @@ STATE_EMB_DIM = 2
 # -------------------------------------------------------------------------
 # Optuna ist ein Tool, welches zur gezielten Suche der optimalen Hyperparameterkonfiguration genutzt werden kann. 
 # Der Suchraum der Parameter wird in der Funktion 'suggest_hyperparameters' bestimmt.
-USE_OPTUNA = True  # Für die Suche der besten Hyperparameter True, für finale Runs mit festgelegten Parametern False
+USE_OPTUNA = False  # Für die Suche der besten Hyperparameter True, für finale Runs mit festgelegten Parametern False
 OPTUNA_TRIALS = 20 # verschiedene Kombinationen an Parametern
 OPTUNA_TIMEOUT_SEC = None
 OPTUNA_SEEDS_PER_TRIAL = 1 # Jede Parameterkombination wird mit defefinierter Anzahl zufällig im Lösungsraum gestartet, Analog zu NUM_SEEDS
@@ -138,7 +138,7 @@ def load_preprocessed():
     else:
         raise FileNotFoundError("Keine preprocessed Datei gefunden (m5_long.csv).")
 
-#     return df
+    return df
 
 
 def build_feature_columns():
