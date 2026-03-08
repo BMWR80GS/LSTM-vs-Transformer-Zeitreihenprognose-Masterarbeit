@@ -59,7 +59,7 @@ SEQ_LEN = 56
 HORIZON = 28
 
 # Anzahl der maximalen Traingsepochen pro Run (Seed). Wird ggf. durch PATIENCE (Early Stopping) vorher beendet.
-MAX_EPOCHS = 20
+MAX_EPOCHS = 2
 
 # Trainingsumfang definieren Ende
 # -----------------------------------------------------------------------------
@@ -72,10 +72,10 @@ MAX_EPOCHS = 20
 BATCH_SIZE = 2560
 
 # Hidden Size: Anzahl der Einheiten (Neuronen) pro verstecktem Layer 
-HIDDEN_SIZE = 256
+HIDDEN_SIZE = 64
 
 # LAYER = Anzahl der LSTM-Layer.
-LAYER = 2
+LAYER = 1
 
 # DROPOUT = Dropout zwischen den LSTM-Layern (wirkt nur bei LAYER > 1).
 DROPOUT = 0.1
@@ -276,7 +276,7 @@ def build_windows(df: pd.DataFrame, split_name: str, series_to_idx: dict, enc_co
 
 class Seq_to_Seq_LSTM(nn.Module):
     # Sequenz to Sequenz (Encoder - Decoder) LSTM-Architektur für Multi-Horizon Forecasting.
-    def __init__(self, enc_features_num: int, dec_features_num: int, hidden_size: int, horizon: int, num_items: int, num_stores: int, num_states: int):
+    def __init__(self, enc_features_num: int, dec_features_num: int, hidden_size: int, horizon: int, num_items: int, num_stores: int, num_states: int, num_layers: int, dropout: float):
         
         super().__init__()
         
@@ -294,8 +294,8 @@ class Seq_to_Seq_LSTM(nn.Module):
         self.encoder = nn.LSTM(
             input_size=self.encoder_input_size, 
             hidden_size=hidden_size, 
-            num_layers=LAYER, 
-            dropout=DROPOUT, 
+            num_layers=num_layers, 
+            dropout=dropout, 
             batch_first=True
         )
         
@@ -304,8 +304,8 @@ class Seq_to_Seq_LSTM(nn.Module):
         self.decoder = nn.LSTM(
             input_size=self.decoder_input_size, 
             hidden_size=hidden_size, 
-            num_layers=LAYER, 
-            dropout=DROPOUT, 
+            num_layers=num_layers, 
+            dropout=dropout, 
             batch_first=True
         )
 
@@ -705,23 +705,25 @@ def train_one_seed(
     )
 
     # Aufbau von DataLoadern für Training und Validierung. Der Trainings-DataLoader wird mit shuffle=True erstellt, um die Reihenfolge der Samples in jedem Epochendurchlauf zu randomisieren, was zu einem robusteren Training führen soll.
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=True)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True)
 
     # Modellinitialisierung.
     # Modell Init
     model = Seq_to_Seq_LSTM(
         enc_features_num=len(feature_cols_enc),
         dec_features_num=len(feature_cols_dec),
-        hidden_size=HIDDEN_SIZE,
+        hidden_size=hidden_size,
         horizon=HORIZON,
         num_items=len(item_ids),
         num_stores=len(store_ids),
         num_states=len(state_ids),
+        num_layers=num_layers,
+        dropout=dropout_rate
     ).to(DEVICE)
 
     # Optimizer, Loss-Funktion und Scheduler Setup.
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     loss_function = nn.MSELoss()
 
      # ReduceLROnPlateau Scheduler
@@ -938,7 +940,7 @@ def main():
 
         objective_function = objective_factory(
             df=df,
-            feature_cols_enc=feature_cols_dec,
+            feature_cols_enc=feature_cols_enc,
             feature_cols_dec=feature_cols_dec,
             series_to_idx=series_to_idx,
             idx_to_series=idx_to_series,
