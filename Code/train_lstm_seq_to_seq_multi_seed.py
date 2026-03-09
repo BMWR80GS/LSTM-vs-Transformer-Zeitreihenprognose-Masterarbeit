@@ -69,7 +69,7 @@ MAX_EPOCHS = 2
 # Modell-Architektur Konfiguration Start
 
 # Batch Size: Wird so festgelegt, dass die GPU maximal ausgelastet wird um das Training zu beschleunigen.
-BATCH_SIZE = 2560
+BATCH_SIZE = 6144
 
 # Hidden Size: Anzahl der Einheiten (Neuronen) pro verstecktem Layer 
 HIDDEN_SIZE = 64
@@ -991,8 +991,9 @@ def main():
 
             seed_summary = train_one_seed(
                 df=df,
-                feature_cols_enc=feature_cols_dec,
+                feature_cols_enc=feature_cols_enc,
                 feature_cols_dec=feature_cols_dec,
+                series_to_idx=series_to_idx,
                 idx_to_series=idx_to_series,
                 item_ids=item_ids,
                 store_ids=store_ids,
