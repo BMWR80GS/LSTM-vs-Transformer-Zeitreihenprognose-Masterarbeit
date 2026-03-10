@@ -1,184 +1,193 @@
-# train_tft_logged.py
-# -----------------------------------------------------------------------------
-# Zweck dieses Skripts:
-#   Training eines Temporal Fusion Transformers (TFT) mittels PyTorch Forecasting.
-#   Das Modell wird auf dem vorverarbeiteten M5-Datensatz trainiert und es werden
-#   zentrale Artefakte für die Auswertung und Dokumentation gespeichert.
-#
-# Wissenschaftlicher Kontext:
-#   Der TFT kombiniert eine Encoder-Decoder-Struktur mit Attention-Mechanismen und
-#   variabler Selektion. Im Vergleich zum LSTM kann der TFT komplexe Zusammenhänge
-#   zwischen zeitvariierenden Kovariaten und Zielvariablen flexibler modellieren.
-#
-# Logging-Strategie:
-#   Da PyTorch Forecasting auf PyTorch Lightning basiert, wird der CSVLogger genutzt,
-#   um train_loss und val_loss zu protokollieren. Anschließend wird eine Excel-Datei
-#   analog zum LSTM erzeugt.
-#
-# Zusätzliche Zeitreihenfeatures:
-#   Für Konsistenz zum LSTM werden Lag- und Rolling-Features ebenfalls berechnet.
-#   Dies ermöglicht in späteren Experimenten eine kontrollierte Untersuchung, ob
-#   diese Features einen Einfluss auf die TFT-Leistung haben.
-#
-# Ausgabe pro Run:
-#   - config.json, system_info.json, summary.json
-#   - metrics.xlsx (config / epochs / summary)
-#   - loss.png / metrics.png
-#   - forecast_example.png
-#   - best.ckpt (Checkpoint mit minimalem val_loss)
-# -----------------------------------------------------------------------------
-
 import json
 import time
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-
 import torch
+
 torch.set_float32_matmul_precision("medium")
 
 import optuna
-from optuna.visualization import (plot_optimization_history, plot_param_importances, plot_parallel_coordinate, plot_slice)
+from optuna.visualization import (
+    plot_optimization_history,
+    plot_parallel_coordinate,
+    plot_param_importances,
+    plot_slice,
+)
 
 import lightning.pytorch as pl
-from lightning.pytorch.loggers import CSVLogger
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
+from lightning.pytorch.loggers import CSVLogger
 
-from pytorch_forecasting import TimeSeriesDataSet, TemporalFusionTransformer
+from pytorch_forecasting import TemporalFusionTransformer, TimeSeriesDataSet
 from pytorch_forecasting.data import GroupNormalizer
 from pytorch_forecasting.metrics import QuantileLoss
 
-from run_logger import (
-    get_system_info,
-    save_json,
-    save_excel,
-    save_plots
-)
+from run_logger import get_system_info, save_excel, save_json, save_plots
+
 
 # -----------------------------------------------------------------------------
-# Pfade zum vorverarbeiteten Datensatz.
+# Pfade
 # -----------------------------------------------------------------------------
-PROCESSED_DIR = Path("data/preprocessed")
-CSV_PATH = PROCESSED_DIR / "m5_long.csv"
-RUNS_DIR = "runs"
+PREP_DIR = Path("data") / "preprocessed"
+CSV_PATH = PREP_DIR / "m5_long.csv"
+RUNS_DIR = Path("runs") / "tft"
+
 
 # -----------------------------------------------------------------------------
-# Hyperparameter.
+# Trainingsumfang / Device
 # -----------------------------------------------------------------------------
+DEVICE = "gpu" if torch.cuda.is_available() else "cpu"
+TORCH_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+BASE_SEED = 1
+NUM_SEEDS = 1
 MAX_SERIES = 200
 
 ENCODER_LEN = 56
 PRED_LEN = 28
-
-BATCH_SIZE = 2048
+HORIZON = PRED_LEN
 MAX_EPOCHS = 1
 
-BASE_SEED = 1
-NUM_SEEDS = 1
 
+# -----------------------------------------------------------------------------
+# Modell-Hyperparameter
+# -----------------------------------------------------------------------------
+BATCH_SIZE = 2048
 LR = 5e-4
 HIDDEN_SIZE = 32
 ATTN_HEAD_SIZE = 4
 HIDDEN_CONT_SIZE = 16
 DROPOUT = 0.1
 
+LR_PATIENCE = 3
+PATIENCE = 3
+
+
+# -----------------------------------------------------------------------------
+# Optuna
+# -----------------------------------------------------------------------------
 USE_OPTUNA = True
 OPTUNA_TRIALS = 2
 OPTUNA_TIMEOUT_SEC = None
 OPTUNA_SEEDS_PER_TRIAL = 1
 OPTUNA_DIRECTION = "minimize"
 
-# -----------------------------------------------------------------------------
-# Early Stopping Einstellungen für TFT (über Lightning Callback).
-# -----------------------------------------------------------------------------
-PATIENCE = 3
 
 # -----------------------------------------------------------------------------
-# Lag- und Rolling-Features (analog zum LSTM).
+# Feature-Konfiguration
+# performant: native TimeSeriesDataSet-Logik
+# vergleichbar: gleiche Kernfeatures wie LSTM (inkl. lag_1, lag_14, rolling std)
 # -----------------------------------------------------------------------------
-LAG_LIST = [1, 7, 28]
+LAG_LIST = [1, 7, 14, 28]
 ROLLING_WINDOWS = [7, 28]
 
-DEVICE = "gpu" if torch.cuda.is_available() else "cpu"
+KNOWN_REAL_FEATURES = [
+    "time_idx",
+    "price_s",
+    "price_missing",
+    "snap",
+    "wday_s",
+    "month_s",
+    "year_s",
+    "has_event_1",
+    "has_event_2",
+]
+
+STATIC_CATEGORICALS = ["item_id", "store_id", "state_id"]
 
 
-def load_preprocessed():
-    # Laden des vorverarbeiteten Datensatzes.
+def set_seed(seed: int) -> None:
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    pl.seed_everything(seed, workers=False)
 
-    if CSV_PATH.exists():
-        df = pd.read_csv(CSV_PATH, parse_dates=["date"])
-    else:
+
+def load_preprocessed() -> pd.DataFrame:
+    if not CSV_PATH.exists():
         raise FileNotFoundError("Keine vorverarbeitete Datei gefunden (m5_long.csv).")
+    return pd.read_csv(CSV_PATH, parse_dates=["date"])
 
-    return df
 
-
-def add_time_series_features(df):
-    # Ergänzung autoregressiver Merkmale (Lag und Rolling Mean) im log-space.
-    # Dies erfolgt primär zur Konsistenz mit dem LSTM-Setup.
+def add_time_series_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df = df.sort_values(["series_id", "time_idx"]).reset_index(drop=True)
+
+    if "y_log" not in df.columns:
+        raise KeyError("Spalte 'y_log' fehlt. Preprocessing ist unvollständig.")
 
     for lag in LAG_LIST:
         df[f"y_log_lag_{lag}"] = df.groupby("series_id")["y_log"].shift(lag)
 
-    for w in ROLLING_WINDOWS:
-        df[f"y_log_roll_mean_{w}"] = (
-            df.groupby("series_id")["y_log"]
-              .shift(1)
-              .rolling(window=w, min_periods=1)
-              .mean()
-              .reset_index(level=0, drop=True)
+    grouped_shifted = df.groupby("series_id")["y_log"].shift(1)
+    for window in ROLLING_WINDOWS:
+        df[f"y_log_roll_mean_{window}"] = (
+            grouped_shifted.rolling(window=window, min_periods=1)
+            .mean()
+            .reset_index(level=0, drop=True)
+        )
+        df[f"y_log_roll_std_{window}"] = (
+            grouped_shifted.rolling(window=window, min_periods=1)
+            .std()
+            .reset_index(level=0, drop=True)
         )
 
-    lag_cols = [f"y_log_lag_{l}" for l in LAG_LIST]
-    roll_cols = [f"y_log_roll_mean_{w}" for w in ROLLING_WINDOWS]
-    df[lag_cols + roll_cols] = df[lag_cols + roll_cols].fillna(0.0)
+    engineered_cols = [f"y_log_lag_{lag}" for lag in LAG_LIST]
+    engineered_cols += [f"y_log_roll_mean_{window}" for window in ROLLING_WINDOWS]
+    engineered_cols += [f"y_log_roll_std_{window}" for window in ROLLING_WINDOWS]
+    df[engineered_cols] = df[engineered_cols].fillna(0.0)
 
     return df
 
 
-def compute_mase_denominators(train_df: pd.DataFrame, seasonality: int = 7) -> dict:
-    denoms = {}
-    for sid, g in train_df.groupby("series_id"):
-        g = g.sort_values("time_idx")
-        if "y" in g.columns:
-            y = g["y"].values.astype(np.float32)
-        else:
-            y = np.expm1(g["y_log"].values.astype(np.float32))
+def build_feature_columns() -> tuple[list, list]:
+    unknown_reals = ["y_log"]
+    unknown_reals += [f"y_log_lag_{lag}" for lag in LAG_LIST]
+    unknown_reals += [f"y_log_roll_mean_{window}" for window in ROLLING_WINDOWS]
+    unknown_reals += [f"y_log_roll_std_{window}" for window in ROLLING_WINDOWS]
+    return KNOWN_REAL_FEATURES.copy(), unknown_reals
 
-        if len(y) <= seasonality:
-            denoms[str(sid)] = 1.0
+
+def compute_mase_denominators(train_df: pd.DataFrame, seasonality: int = 7) -> dict:
+    denominators = {}
+    for series_id, group in train_df.groupby("series_id"):
+        group = group.sort_values("time_idx")
+        if "y" in group.columns:
+            y_values = group["y"].to_numpy(dtype=np.float32)
+        else:
+            y_values = np.expm1(group["y_log"].to_numpy(dtype=np.float32))
+
+        if len(y_values) <= seasonality:
+            denominators[str(series_id)] = 1.0
             continue
 
-        diff = np.abs(y[seasonality:] - y[:-seasonality])
-        den = float(np.mean(diff)) if np.mean(diff) > 0 else 1.0
-        denoms[str(sid)] = den
+        diffs = np.abs(y_values[seasonality:] - y_values[:-seasonality])
+        denom = float(np.mean(diffs)) if np.mean(diffs) > 0 else 1.0
+        denominators[str(series_id)] = denom
+    return denominators
 
-    return denoms
 
-
-def get_series_id_mapping(training_ds):
+def get_series_id_mapping(training_ds: TimeSeriesDataSet):
     mapping = None
-
     if hasattr(training_ds, "categorical_encoders"):
         encoders = getattr(training_ds, "categorical_encoders", {})
         if isinstance(encoders, dict) and "series_id" in encoders:
-            enc = encoders["series_id"]
+            encoder = encoders["series_id"]
             classes = None
-            if hasattr(enc, "classes_"):
-                classes = list(getattr(enc, "classes_"))
-            elif hasattr(enc, "classes"):
-                classes = list(getattr(enc, "classes"))
+            if hasattr(encoder, "classes_"):
+                classes = list(getattr(encoder, "classes_"))
+            elif hasattr(encoder, "classes"):
+                classes = list(getattr(encoder, "classes"))
             if classes is not None:
                 mapping = {int(i): str(v) for i, v in enumerate(classes)}
-
     return mapping
 
 
-def extract_series_ids_from_raw_x(raw_x, series_mapping):
+def extract_series_ids_from_raw_x(raw_x, series_mapping) -> np.ndarray:
     groups_key = None
     if isinstance(raw_x, dict):
         if "groups" in raw_x:
@@ -190,27 +199,40 @@ def extract_series_ids_from_raw_x(raw_x, series_mapping):
         raise KeyError("Konnte keine Gruppeninformation (groups/group_ids) in raw.x finden.")
 
     group_values = raw_x[groups_key]
-
     if isinstance(group_values, torch.Tensor):
         group_values = group_values.detach().cpu().numpy()
 
     group_values = np.asarray(group_values)
-
     if group_values.ndim == 2:
         group_values = group_values[:, 0]
 
     series_ids = []
-    for v in group_values.tolist():
+    for value in group_values.tolist():
         try:
-            v_int = int(v)
-            if series_mapping is not None and v_int in series_mapping:
-                series_ids.append(series_mapping[v_int])
+            value_int = int(value)
+            if series_mapping is not None and value_int in series_mapping:
+                series_ids.append(series_mapping[value_int])
             else:
-                series_ids.append(str(v_int))
+                series_ids.append(str(value_int))
         except Exception:
-            series_ids.append(str(v))
+            series_ids.append(str(value))
 
     return np.asarray(series_ids, dtype=object)
+
+
+def extract_point_forecast(prediction_array: np.ndarray) -> np.ndarray:
+    predictions = np.asarray(prediction_array)
+    if predictions.ndim == 3 and predictions.shape[2] > 1:
+        return predictions[:, :, predictions.shape[2] // 2]
+    if predictions.ndim == 3:
+        return predictions[:, :, 0]
+    return predictions
+
+
+def eval_loss_logspace_from_raw(raw_prediction) -> float:
+    pred_y_log = extract_point_forecast(raw_prediction.output.prediction.detach().cpu().numpy())
+    true_y_log = raw_prediction.x["decoder_target"].detach().cpu().numpy()
+    return float(np.mean((pred_y_log - true_y_log) ** 2))
 
 
 def eval_mase_mse_wape_weekly_from_arrays(pred_y, true_y, series_ids, mase_denoms):
@@ -223,18 +245,17 @@ def eval_mase_mse_wape_weekly_from_arrays(pred_y, true_y, series_ids, mase_denom
     true_y = np.clip(true_y, a_min=0.0, a_max=None)
 
     abs_err = np.abs(pred_y - true_y)
-
     mse = float(np.mean((pred_y - true_y) ** 2))
 
-    den = np.array([float(mase_denoms.get(str(sid), 1.0)) for sid in series_ids], dtype=np.float32)
+    den = np.array([float(mase_denoms.get(str(series_id), 1.0)) for series_id in series_ids], dtype=np.float32)
     den = np.where(den > 0, den, 1.0)
 
     mae_overall = np.mean(abs_err, axis=1)
     mase = float(np.mean(mae_overall / den))
 
     mase_weeks = []
-    for a, b in week_slices:
-        mae_week = np.mean(abs_err[:, a:b], axis=1)
+    for start, end in week_slices:
+        mae_week = np.mean(abs_err[:, start:end], axis=1)
         mase_weeks.append(float(np.mean(mae_week / den)))
 
     wape_num = float(np.sum(abs_err))
@@ -242,9 +263,9 @@ def eval_mase_mse_wape_weekly_from_arrays(pred_y, true_y, series_ids, mase_denom
     wape = (wape_num / wape_den) if wape_den > 0 else float("nan")
 
     wape_weeks = []
-    for a, b in week_slices:
-        num = float(np.sum(abs_err[:, a:b]))
-        den_w = float(np.sum(true_y[:, a:b]))
+    for start, end in week_slices:
+        num = float(np.sum(abs_err[:, start:end]))
+        den_w = float(np.sum(true_y[:, start:end]))
         wape_weeks.append((num / den_w) if den_w > 0 else float("nan"))
 
     return {
@@ -262,48 +283,35 @@ def eval_mase_mse_wape_weekly_from_arrays(pred_y, true_y, series_ids, mase_denom
     }
 
 
-def build_timeseries_datasets(df):
-    # Aufbau von TimeSeriesDataSet-Objekten für Training/Validierung/Test.
-    #
-    # Split-Logik:
-    #   Der maximale time_idx im Trainingssplit wird als train_cutoff interpretiert.
-    #   Anschließend werden Validierung und Test jeweils um PRED_LEN erweitert.
-    #
-    # Hinweis:
-    #   PyTorch Forecasting arbeitet typischerweise zeitbasiert mit cutoffs und
-    #   generiert daraus Forecast-Fenster (predict=True).
+def build_timeseries_datasets(df: pd.DataFrame):
     df = df.copy()
     df["series_id"] = df["series_id"].astype(str)
+    df["item_id"] = df["item_id"].astype(str)
+    df["store_id"] = df["store_id"].astype(str)
+    df["state_id"] = df["state_id"].astype(str)
     df["time_idx"] = df["time_idx"].astype(int)
 
-    if "y_log" not in df.columns:
-        raise KeyError("Spalte 'y_log' fehlt. Preprocessing ist unvollständig.")
+    if MAX_SERIES is not None:
+        allowed_series = sorted(df["series_id"].unique())[:MAX_SERIES]
+        df = df[df["series_id"].isin(allowed_series)].copy()
+
+    known_reals, unknown_reals = build_feature_columns()
+
+    missing_known = [col for col in known_reals if col not in df.columns]
+    missing_unknown = [col for col in unknown_reals if col not in df.columns]
+    if missing_known or missing_unknown:
+        raise KeyError(f"Fehlende Feature-Spalten. known={missing_known}, unknown={missing_unknown}")
 
     train_cutoff = int(df.loc[df["split"] == "train", "time_idx"].max())
-    val_cutoff = train_cutoff + PRED_LEN
-    test_cutoff = val_cutoff + PRED_LEN
-
-    known_reals = [
-        "time_idx",
-        "price_s",
-        "price_missing",
-        "snap",
-        "wday_s",
-        "month_s",
-        "year_s",
-        "has_event_1",
-        "has_event_2",
-    ]
-
-    unknown_reals = ["y_log"]
-    unknown_reals += [f"y_log_lag_{l}" for l in LAG_LIST]
-    unknown_reals += [f"y_log_roll_mean_{w}" for w in ROLLING_WINDOWS]
+    val_cutoff = int(df.loc[df["split"] == "val", "time_idx"].max())
+    test_cutoff = int(df.loc[df["split"] == "test", "time_idx"].max())
 
     training = TimeSeriesDataSet(
         df[df.time_idx <= train_cutoff],
         time_idx="time_idx",
         target="y_log",
         group_ids=["series_id"],
+        static_categoricals=STATIC_CATEGORICALS,
         min_encoder_length=ENCODER_LEN,
         max_encoder_length=ENCODER_LEN,
         min_prediction_length=PRED_LEN,
@@ -314,21 +322,20 @@ def build_timeseries_datasets(df):
         add_relative_time_idx=True,
         add_target_scales=True,
         add_encoder_length=True,
+        allow_missing_timesteps=False,
     )
 
-    val_data = df[df.time_idx <= val_cutoff]
     validation = TimeSeriesDataSet.from_dataset(
         training,
-        val_data,
+        df[df.time_idx <= val_cutoff],
         predict=True,
         stop_randomization=True,
         min_prediction_idx=train_cutoff + 1,
     )
 
-    test_data = df[df.time_idx <= test_cutoff]
     test = TimeSeriesDataSet.from_dataset(
         training,
-        test_data,
+        df[df.time_idx <= test_cutoff],
         predict=True,
         stop_randomization=True,
         min_prediction_idx=val_cutoff + 1,
@@ -337,94 +344,60 @@ def build_timeseries_datasets(df):
     return training, validation, test
 
 
-def save_forecast_example(model, test_loader, out_path):
-    # Speicherung einer Beispielvorhersage zur qualitativen Plausibilisierung.
-    raw = model.predict(test_loader, mode="raw", return_x=True)
+# def save_forecast_example(model, test_loader, out_path: Path) -> None:
+#     raw = model.predict(test_loader, mode="raw", return_x=True)
+#     preds = extract_point_forecast(raw.output.prediction.detach().cpu().numpy())
+#     true_y_log = raw.x["decoder_target"].detach().cpu().numpy()
 
-    preds = raw.output.prediction.detach().cpu().numpy()
-    x = raw.x
-    true = x["decoder_target"].detach().cpu().numpy()
+#     pred_y = np.expm1(preds).clip(min=0.0)
+#     true_y = np.expm1(true_y_log).clip(min=0.0)
 
-    if preds.ndim == 3 and preds.shape[2] > 1:
-        preds = preds[:, :, preds.shape[2] // 2]
-    elif preds.ndim == 3:
-        preds = preds[:, :, 0]
-
-    pred_y = np.expm1(preds).clip(min=0.0)
-    true_y = np.expm1(true).clip(min=0.0)
-
-    plt.figure()
-    plt.plot(true_y[0], label="True")
-    plt.plot(pred_y[0], label="Pred", linestyle="--")
-    plt.title("Beispielvorhersage (TFT, Testsplit)")
-    plt.xlabel("Forecast-Schritt")
-    plt.ylabel("Sales")
-    plt.grid(True)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=150)
-    plt.close()
-
-
-def build_seed_list() -> list:
-    if NUM_SEEDS <= 1:
-        return [BASE_SEED]
-    return [BASE_SEED + i for i in range(NUM_SEEDS)]
-
-
-def build_trial_seed_list(trial_base_seed: int, trial_seed_count: int) -> list:
-    if trial_seed_count <= 1:
-        return [trial_base_seed]
-    return [trial_base_seed + i for i in range(trial_seed_count)]
+#     plt.figure()
+#     plt.plot(true_y[0], label="True")
+#     plt.plot(pred_y[0], label="Pred", linestyle="--")
+#     plt.title("Beispielvorhersage (TFT, Testsplit)")
+#     plt.xlabel("Forecast-Schritt")
+#     plt.ylabel("Sales")
+#     plt.grid(True)
+#     plt.legend()
+#     plt.tight_layout()
+#     plt.savefig(out_path, dpi=150)
+#     plt.close()
 
 
 def suggest_hyperparameters(optuna_trial: optuna.Trial) -> dict:
-    suggested_hyperparameters = {
+    return {
         "learning_rate": optuna_trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True),
         "hidden_size": optuna_trial.suggest_categorical("hidden_size", [16, 32]),
         "attention_head_size": optuna_trial.suggest_categorical("attention_head_size", [1, 2, 4]),
-        "hidden_continuous_size": optuna_trial.suggest_categorical("hidden_continuous_size", [8, 16, 32]),
+        "hidden_continuous_size": optuna_trial.suggest_categorical("hidden_continuous_size", [8, 16]),
         "dropout": optuna_trial.suggest_float("dropout", 0.0, 0.3),
-        "batch_size": optuna_trial.suggest_categorical("batch_size", [BATCH_SIZE]),
+        "batch_size": optuna_trial.suggest_categorical("batch_size", [2048]),
     }
-    return suggested_hyperparameters
 
 
-def objective_factory(
-    df: pd.DataFrame,
-    mase_denoms: dict,
-    optuna_base_dir: Path,
-):
-    def objective(optuna_trial: optuna.Trial) -> float:
-        suggested_hyperparameters = suggest_hyperparameters(optuna_trial)
-
-        trial_run_dir = optuna_base_dir / f"optuna_trial_{optuna_trial.number:04d}"
-        trial_run_dir.mkdir(parents=True, exist_ok=True)
-
-        trial_seed_list = build_trial_seed_list(BASE_SEED, OPTUNA_SEEDS_PER_TRIAL)
-
-        validation_mase_values = []
-        for seed_value in trial_seed_list:
-            seed_run_dir = trial_run_dir / f"seed_{seed_value}"
-            seed_run_dir.mkdir(parents=True, exist_ok=True)
-
-            seed_summary = train_one_seed(
-                df=df,
-                mase_denoms=mase_denoms,
-                run_dir=seed_run_dir,
-                seed_value=seed_value,
-                hpo_params=suggested_hyperparameters,
-            )
-            validation_mase_values.append(float(seed_summary["val_mase"]))
-
-        mean_validation_mase = float(np.mean(validation_mase_values)) if validation_mase_values else float("inf")
-
-        optuna_trial.set_user_attr("trial_seeds", trial_seed_list)
-        optuna_trial.set_user_attr("val_mases", validation_mase_values)
-
-        return mean_validation_mase
-
-    return objective
+def reorder_metrics_columns(metrics_dataframe: pd.DataFrame) -> pd.DataFrame:
+    column_order = [
+        "epoch",
+        "train_loss",
+        "val_loss",
+        "val_mase",
+        "val_mase_w1",
+        "val_mase_w2",
+        "val_mase_w3",
+        "val_mase_w4",
+        "val_wape",
+        "val_wape_w1",
+        "val_wape_w2",
+        "val_wape_w3",
+        "val_wape_w4",
+        "val_mse",
+        "lr",
+        "epoch_time_sec",
+    ]
+    existing_columns = [col for col in column_order if col in metrics_dataframe.columns]
+    remaining_columns = [col for col in metrics_dataframe.columns if col not in existing_columns]
+    return metrics_dataframe[existing_columns + remaining_columns]
 
 
 def train_one_seed(
@@ -432,7 +405,7 @@ def train_one_seed(
     mase_denoms: dict,
     run_dir: Path,
     seed_value: int,
-    hpo_params: dict = None,
+    hpo_params: dict | None = None,
 ) -> dict:
     learning_rate = LR
     hidden_size = HIDDEN_SIZE
@@ -449,18 +422,12 @@ def train_one_seed(
         dropout_rate = float(hpo_params.get("dropout", dropout_rate))
         batch_size = int(hpo_params.get("batch_size", batch_size))
 
-    pl.seed_everything(seed_value, workers=False)
+    set_seed(seed_value)
 
     seed_config = {
         "model": "TFT",
         "encoder_len": ENCODER_LEN,
         "pred_len": PRED_LEN,
-        "batch_size": batch_size,
-        "lr": learning_rate,
-        "hidden_size": hidden_size,
-        "attn_head_size": attention_head_size,
-        "hidden_cont_size": hidden_continuous_size,
-        "dropout": dropout_rate,
         "batch_size": batch_size,
         "lr": learning_rate,
         "hidden_size": hidden_size,
@@ -476,6 +443,8 @@ def train_one_seed(
         "base_seed": BASE_SEED,
         "num_seeds": NUM_SEEDS,
         "seed": int(seed_value),
+        "known_real_features": KNOWN_REAL_FEATURES,
+        "static_categoricals": STATIC_CATEGORICALS,
     }
 
     save_json(run_dir / "config.json", seed_config)
@@ -484,9 +453,27 @@ def train_one_seed(
     training_ds, val_ds, test_ds = build_timeseries_datasets(df)
     series_mapping = get_series_id_mapping(training_ds)
 
-    train_loader = training_ds.to_dataloader(train=True, batch_size=batch_size, num_workers=1, persistent_workers=True)
-    val_loader = val_ds.to_dataloader(train=False, batch_size=batch_size, num_workers=1, persistent_workers=True)
-    test_loader = test_ds.to_dataloader(train=False, batch_size=batch_size, num_workers=1, persistent_workers=True)
+    train_loader = training_ds.to_dataloader(
+        train=True,
+        batch_size=batch_size,
+        num_workers=1,
+        persistent_workers=True,
+        pin_memory=(TORCH_DEVICE == "cuda"),
+    )
+    val_loader = val_ds.to_dataloader(
+        train=False,
+        batch_size=batch_size,
+        num_workers=1,
+        persistent_workers=True,
+        pin_memory=(TORCH_DEVICE == "cuda"),
+    )
+    # test_loader = test_ds.to_dataloader(
+    #     train=False,
+    #     batch_size=batch_size,
+    #     num_workers=1,
+    #     persistent_workers=True,
+    #     pin_memory=(TORCH_DEVICE == "cuda"),
+    # )
 
     model = TemporalFusionTransformer.from_dataset(
         training_ds,
@@ -497,18 +484,7 @@ def train_one_seed(
         dropout=dropout_rate,
         loss=QuantileLoss(quantiles=[0.1, 0.5, 0.9]),
         log_interval=10,
-        reduce_on_plateau_patience=3,
-    )
-    model = TemporalFusionTransformer.from_dataset(
-        training_ds,
-        learning_rate=learning_rate,
-        hidden_size=hidden_size,
-        attention_head_size=attention_head_size,
-        hidden_continuous_size=hidden_continuous_size,
-        dropout=dropout_rate,
-        loss=QuantileLoss(quantiles=[0.1, 0.5, 0.9]),
-        log_interval=10,
-        reduce_on_plateau_patience=3,
+        reduce_on_plateau_patience=LR_PATIENCE,
     )
 
     csv_logger = CSVLogger(save_dir=str(run_dir), name="lightning_logs")
@@ -520,19 +496,7 @@ def train_one_seed(
         save_top_k=1,
         mode="min",
     )
-    ckpt = ModelCheckpoint(
-        dirpath=str(run_dir),
-        filename="best",
-        monitor="val_loss",
-        save_top_k=1,
-        mode="min",
-    )
 
-    early = EarlyStopping(
-        monitor="val_loss",
-        patience=PATIENCE,
-        mode="min",
-    )
     early = EarlyStopping(
         monitor="val_loss",
         patience=PATIENCE,
@@ -543,30 +507,19 @@ def train_one_seed(
         max_epochs=MAX_EPOCHS,
         accelerator=DEVICE,
         devices=1,
-        precision="bf16-mixed",
+        precision="bf16-mixed" if TORCH_DEVICE == "cuda" else "32-true",
         gradient_clip_val=0.1,
         logger=csv_logger,
         callbacks=[ckpt, early],
         log_every_n_steps=70,
         enable_progress_bar=False,
-        profiler="Simple",
-    )
-    trainer = pl.Trainer(
-        max_epochs=MAX_EPOCHS,
-        accelerator=DEVICE,
-        devices=1,
-        precision="bf16-mixed",
-        gradient_clip_val=0.1,
-        logger=csv_logger,
-        callbacks=[ckpt, early],
-        log_every_n_steps=70,
-        enable_progress_bar=False,
+        enable_model_summary=False,
         profiler="Simple",
     )
 
-    total_start = time.time()
+    total_start = time.perf_counter()
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
-    total_time = time.time() - total_start
+    total_time = time.perf_counter() - total_start
 
     best_path = ckpt.best_model_path
     if best_path:
@@ -574,64 +527,89 @@ def train_one_seed(
 
     metrics_csv = Path(csv_logger.log_dir) / "metrics.csv"
     epoch_rows = []
-
     if metrics_csv.exists():
         log_df = pd.read_csv(metrics_csv)
-        epochs = sorted(log_df["epoch"].dropna().unique().tolist())
+        epochs = sorted(int(ep) for ep in log_df["epoch"].dropna().unique().tolist()) if "epoch" in log_df.columns else []
         for ep in epochs:
-            ep = int(ep)
-            sub = log_df[log_df["epoch"] == ep]
+            subset = log_df[log_df["epoch"] == ep]
 
             train_loss = np.nan
             val_loss = np.nan
+            lr_value = float(learning_rate)
 
-            if "train_loss" in sub.columns:
-                tmp = sub["train_loss"].dropna()
-                if len(tmp) > 0:
-                    train_loss = float(tmp.iloc[-1])
+            for train_key in ["train_loss_epoch", "train_loss"]:
+                if train_key in subset.columns:
+                    tmp = subset[train_key].dropna()
+                    if len(tmp) > 0:
+                        train_loss = float(tmp.iloc[-1])
+                        break
 
-            if "val_loss" in sub.columns:
-                tmp = sub["val_loss"].dropna()
+            if "val_loss" in subset.columns:
+                tmp = subset["val_loss"].dropna()
                 if len(tmp) > 0:
                     val_loss = float(tmp.iloc[-1])
 
-            epoch_rows.append({
-                "epoch": ep + 1,
-                "train_loss": train_loss,
-                "val_loss": val_loss,
-            })
+            for lr_key in ["lr-Adam", "lr"]:
+                if lr_key in subset.columns:
+                    tmp = subset[lr_key].dropna()
+                    if len(tmp) > 0:
+                        lr_value = float(tmp.iloc[-1])
+                        break
+
+            epoch_rows.append(
+                {
+                    "epoch": ep + 1,
+                    "train_loss": train_loss,
+                    "val_loss": val_loss,
+                    "lr": lr_value,
+                    "epoch_time_sec": np.nan,
+                }
+            )
 
     val_raw = model.predict(val_loader, mode="raw", return_x=True)
-    val_preds = val_raw.output.prediction.detach().cpu().numpy()
-    val_x = val_raw.x
-    val_true = val_x["decoder_target"].detach().cpu().numpy()
-
-    if val_preds.ndim == 3 and val_preds.shape[2] > 1:
-        val_preds = val_preds[:, :, val_preds.shape[2] // 2]
-    elif val_preds.ndim == 3:
-        val_preds = val_preds[:, :, 0]
-
+    val_preds = extract_point_forecast(val_raw.output.prediction.detach().cpu().numpy())
+    val_true_log = val_raw.x["decoder_target"].detach().cpu().numpy()
     val_pred_y = np.expm1(val_preds).clip(min=0.0)
-    val_true_y = np.expm1(val_true).clip(min=0.0)
-
-    val_series_ids = extract_series_ids_from_raw_x(val_x, series_mapping)
+    val_true_y = np.expm1(val_true_log).clip(min=0.0)
+    val_series_ids = extract_series_ids_from_raw_x(val_raw.x, series_mapping)
     val_metrics = eval_mase_mse_wape_weekly_from_arrays(val_pred_y, val_true_y, val_series_ids, mase_denoms)
+    external_val_loss = eval_loss_logspace_from_raw(val_raw)
 
-    test_raw = model.predict(test_loader, mode="raw", return_x=True)
-    test_preds = test_raw.output.prediction.detach().cpu().numpy()
-    test_x = test_raw.x
-    test_true = test_x["decoder_target"].detach().cpu().numpy()
+    # test_raw = model.predict(test_loader, mode="raw", return_x=True)
+    # test_preds = extract_point_forecast(test_raw.output.prediction.detach().cpu().numpy())
+    # test_true_log = test_raw.x["decoder_target"].detach().cpu().numpy()
+    # test_pred_y = np.expm1(test_preds).clip(min=0.0)
+    # test_true_y = np.expm1(test_true_log).clip(min=0.0)
+    # test_series_ids = extract_series_ids_from_raw_x(test_raw.x, series_mapping)
+    # test_metrics = eval_mase_mse_wape_weekly_from_arrays(test_pred_y, test_true_y, test_series_ids, mase_denoms)
 
-    if test_preds.ndim == 3 and test_preds.shape[2] > 1:
-        test_preds = test_preds[:, :, test_preds.shape[2] // 2]
-    elif test_preds.ndim == 3:
-        test_preds = test_preds[:, :, 0]
+    if not epoch_rows:
+        epoch_rows = [{
+            "epoch": 1,
+            "train_loss": np.nan,
+            "val_loss": np.nan,
+            "lr": float(learning_rate),
+            "epoch_time_sec": float(total_time),
+        }]
 
-    test_pred_y = np.expm1(test_preds).clip(min=0.0)
-    test_true_y = np.expm1(test_true).clip(min=0.0)
+    epoch_rows[-1]["val_loss"] = float(external_val_loss)
+    epoch_rows[-1]["val_mase"] = float(val_metrics["mase"])
+    epoch_rows[-1]["val_mase_w1"] = float(val_metrics["mase_w1"])
+    epoch_rows[-1]["val_mase_w2"] = float(val_metrics["mase_w2"])
+    epoch_rows[-1]["val_mase_w3"] = float(val_metrics["mase_w3"])
+    epoch_rows[-1]["val_mase_w4"] = float(val_metrics["mase_w4"])
+    epoch_rows[-1]["val_wape"] = float(val_metrics["wape"])
+    epoch_rows[-1]["val_wape_w1"] = float(val_metrics["wape_w1"])
+    epoch_rows[-1]["val_wape_w2"] = float(val_metrics["wape_w2"])
+    epoch_rows[-1]["val_wape_w3"] = float(val_metrics["wape_w3"])
+    epoch_rows[-1]["val_wape_w4"] = float(val_metrics["wape_w4"])
+    epoch_rows[-1]["val_mse"] = float(val_metrics["mse"])
+    epoch_rows[-1]["epoch_time_sec"] = float(total_time / max(len(epoch_rows), 1))
 
-    test_series_ids = extract_series_ids_from_raw_x(test_x, series_mapping)
-    test_metrics = eval_mase_mse_wape_weekly_from_arrays(test_pred_y, test_true_y, test_series_ids, mase_denoms)
+    metrics_dataframe = reorder_metrics_columns(pd.DataFrame(epoch_rows))
+    metrics_dataframe.to_csv(run_dir / "metrics.csv", index=False)
+
+    save_plots(run_dir, epoch_rows)
 
     summary = {
         "seed": int(seed_value),
@@ -649,16 +627,18 @@ def train_one_seed(
         "val_wape_w2": float(val_metrics["wape_w2"]),
         "val_wape_w3": float(val_metrics["wape_w3"]),
         "val_wape_w4": float(val_metrics["wape_w4"]),
-        "test_mase": float(test_metrics["mase"]),
-        "test_mase_w1": float(test_metrics["mase_w1"]),
-        "test_mase_w2": float(test_metrics["mase_w2"]),
-        "test_mase_w3": float(test_metrics["mase_w3"]),
-        "test_mase_w4": float(test_metrics["mase_w4"]),
-        "test_wape": float(test_metrics["wape"]),
-        "test_wape_w1": float(test_metrics["wape_w1"]),
-        "test_wape_w2": float(test_metrics["wape_w2"]),
-        "test_wape_w3": float(test_metrics["wape_w3"]),
-        "test_wape_w4": float(test_metrics["wape_w4"]),
+        "val_mse": float(val_metrics["mse"]),
+        # "test_mase": float(test_metrics["mase"]),
+        # "test_mase_w1": float(test_metrics["mase_w1"]),
+        # "test_mase_w2": float(test_metrics["mase_w2"]),
+        # "test_mase_w3": float(test_metrics["mase_w3"]),
+        # "test_mase_w4": float(test_metrics["mase_w4"]),
+        # "test_wape": float(test_metrics["wape"]),
+        # "test_wape_w1": float(test_metrics["wape_w1"]),
+        # "test_wape_w2": float(test_metrics["wape_w2"]),
+        # "test_wape_w3": float(test_metrics["wape_w3"]),
+        # "test_wape_w4": float(test_metrics["wape_w4"]),
+        # "test_mse": float(test_metrics["mse"]),
     }
 
     save_json(run_dir / "summary.json", summary)
@@ -666,13 +646,53 @@ def train_one_seed(
 
     print("Saved:", run_dir / "metrics.xlsx")
     print("Best checkpoint:", best_path)
-
     return summary
+
+
+def build_trial_seed_list(trial_base_seed: int, trial_seed_count: int) -> list[int]:
+    if trial_seed_count <= 1:
+        return [trial_base_seed]
+    return [trial_base_seed + i for i in range(trial_seed_count)]
+
+
+def objective_factory(df: pd.DataFrame, mase_denoms: dict, optuna_base_dir: Path):
+    def objective(optuna_trial: optuna.Trial) -> float:
+        suggested_hyperparameters = suggest_hyperparameters(optuna_trial)
+        trial_run_dir = optuna_base_dir / f"optuna_trial_{optuna_trial.number:04d}"
+        trial_run_dir.mkdir(parents=True, exist_ok=True)
+
+        trial_seed_list = build_trial_seed_list(BASE_SEED, OPTUNA_SEEDS_PER_TRIAL)
+        validation_mase_values = []
+
+        for seed_value in trial_seed_list:
+            seed_run_dir = trial_run_dir / f"seed_{seed_value}"
+            seed_run_dir.mkdir(parents=True, exist_ok=True)
+            seed_summary = train_one_seed(
+                df=df,
+                mase_denoms=mase_denoms,
+                run_dir=seed_run_dir,
+                seed_value=seed_value,
+                hpo_params=suggested_hyperparameters,
+            )
+            validation_mase_values.append(float(seed_summary["val_mase"]))
+
+        mean_validation_mase = float(np.mean(validation_mase_values)) if validation_mase_values else float("inf")
+        optuna_trial.set_user_attr("trial_seeds", trial_seed_list)
+        optuna_trial.set_user_attr("val_mases", validation_mase_values)
+        return mean_validation_mase
+
+    return objective
 
 
 def main():
     df = load_preprocessed()
     df = add_time_series_features(df)
+
+    known_reals, unknown_reals = build_feature_columns()
+    required_cols = ["series_id", "item_id", "store_id", "state_id", "time_idx", "split", "y_log"] + known_reals + unknown_reals
+    missing_cols = [col for col in dict.fromkeys(required_cols) if col not in df.columns]
+    if missing_cols:
+        raise KeyError(f"Fehlende Spalten im DataFrame: {missing_cols}")
 
     train_df = df[df["split"] == "train"].copy()
     mase_denoms = compute_mase_denominators(train_df, seasonality=7)
@@ -691,21 +711,20 @@ def main():
         "patience": PATIENCE,
         "lags": LAG_LIST,
         "rolling_windows": ROLLING_WINDOWS,
+        "known_real_features": known_reals,
+        "unknown_real_features": unknown_reals,
+        "static_categoricals": STATIC_CATEGORICALS,
         "max_series": MAX_SERIES,
         "device": DEVICE,
         "base_seed": BASE_SEED,
         "num_seeds": NUM_SEEDS,
         "use_optuna": USE_OPTUNA,
         "optuna_trials": OPTUNA_TRIALS,
-        "optuna_timeout_sec": OPTUNA_TIMEOUT_SEC,
-        "optuna_seeds_per_trial": OPTUNA_SEEDS_PER_TRIAL,
-        "optuna_direction": OPTUNA_DIRECTION,
     }
 
     ts = time.strftime("%Y%m%d-%H%M%S")
-    parent_run_dir = Path(RUNS_DIR) / "tft" / f"{ts}TFT__base_seed={BASE_SEED}__num_seeds={NUM_SEEDS}"
+    parent_run_dir = RUNS_DIR / f"{ts}_MultiSeed_TFT_fast_comparable__base_seed={BASE_SEED}__num_seeds={NUM_SEEDS}"
     parent_run_dir.mkdir(parents=True, exist_ok=True)
-
     save_json(parent_run_dir / "config.json", config)
     save_json(parent_run_dir / "system_info.json", get_system_info())
 
@@ -713,124 +732,61 @@ def main():
         optuna_run_dir = parent_run_dir / "optuna"
         optuna_run_dir.mkdir(parents=True, exist_ok=True)
 
-        objective_function = objective_factory(
-            df=df,
-            mase_denoms=mase_denoms,
-            optuna_base_dir=optuna_run_dir,
-        )
-
+        objective_function = objective_factory(df=df, mase_denoms=mase_denoms, optuna_base_dir=optuna_run_dir)
         optuna_study = optuna.create_study(direction=OPTUNA_DIRECTION)
-        optuna_study.optimize(objective_function, n_trials=OPTUNA_TRIALS + 1, timeout=OPTUNA_TIMEOUT_SEC)
+        optuna_study.optimize(objective_function, n_trials=OPTUNA_TRIALS, timeout=OPTUNA_TIMEOUT_SEC)
 
-        fig1 = plot_optimization_history(optuna_study)
-        fig1.write_html(optuna_run_dir / "optuna_optimization_history.html")
-
-        fig2 = plot_param_importances(optuna_study)
-        fig2.write_html(optuna_run_dir / "optuna_param_importances.html")
-
-        fig3 = plot_parallel_coordinate(optuna_study)
-        fig3.write_html(optuna_run_dir / "optuna_parallel_coordinate.html")
-
-        fig4 = plot_slice(optuna_study)
-        fig4.write_html(optuna_run_dir / "optuna_slice.html")
+        plot_optimization_history(optuna_study).write_html(optuna_run_dir / "optuna_optimization_history.html")
+        plot_param_importances(optuna_study).write_html(optuna_run_dir / "optuna_param_importances.html")
+        plot_parallel_coordinate(optuna_study).write_html(optuna_run_dir / "optuna_parallel_coordinate.html")
+        plot_slice(optuna_study).write_html(optuna_run_dir / "optuna_slice.html")
 
         best_hyperparameters = optuna_study.best_params
+        save_json(
+            optuna_run_dir / "optuna_summary.json",
+            {
+                "best_value": float(optuna_study.best_value),
+                "best_params": best_hyperparameters,
+                "n_trials": int(len(optuna_study.trials)),
+            },
+        )
+    else:
+        best_hyperparameters = None
 
-        print("Optuna bester Wert (mean val_mase):", optuna_study.best_value)
-        print("Optuna beste Parameter:", best_hyperparameters)
-
-        seed_list = build_seed_list()
-
-        all_seed_summaries = []
-        best_overall_val_mase = float("inf")
-        best_overall_val_loss = float("inf")
-        best_overall_seed = None
-        best_overall_ckpt = parent_run_dir / "best_model_overall_bestparams.ckpt"
-
-        for seed_value in seed_list:
-            seed_run_dir = parent_run_dir / f"bestparams_seed_{seed_value}"
-            seed_run_dir.mkdir(parents=True, exist_ok=True)
-
-            seed_summary = train_one_seed(
-                df=df,
-                mase_denoms=mase_denoms,
-                run_dir=seed_run_dir,
-                seed_value=seed_value,
-                hpo_params=best_hyperparameters,
-            )
-
-            all_seed_summaries.append(seed_summary)
-
-            if np.isfinite(seed_summary["val_mase"]) and seed_summary["val_mase"] < best_overall_val_mase:
-                best_overall_val_mase = float(seed_summary["val_mase"])
-                best_overall_val_loss = float(seed_summary["best_val_loss"]) if seed_summary["best_val_loss"] is not None else float("inf")
-                best_overall_seed = int(seed_value)
-                best_path = seed_summary["best_model_path"]
-                if best_path:
-                    best_overall_ckpt.write_bytes(Path(best_path).read_bytes())
-            elif not np.isfinite(seed_summary["val_mase"]):
-                if seed_summary["best_val_loss"] is not None and float(seed_summary["best_val_loss"]) < best_overall_val_loss:
-                    best_overall_val_loss = float(seed_summary["best_val_loss"])
-                    best_overall_seed = int(seed_value)
-                    best_path = seed_summary["best_model_path"]
-                    if best_path:
-                        best_overall_ckpt.write_bytes(Path(best_path).read_bytes())
-
-        overall_summary = {
-            "best_overall_seed": best_overall_seed,
-            "best_overall_val_mase": float(best_overall_val_mase),
-            "best_overall_val_loss": float(best_overall_val_loss),
-            "best_checkpoint_path": str(best_overall_ckpt),
-            "seed_summaries": all_seed_summaries,
-            "optuna_best_params": best_hyperparameters,
-            "optuna_best_value": float(optuna_study.best_value),
-        }
-        save_json(parent_run_dir / "overall_summary_bestparams.json", overall_summary)
-
-        print("Saved:", parent_run_dir / "overall_summary_bestparams.json")
-        return
-
-    seed_list = build_seed_list()
-
+    all_seed_summaries = []
     best_overall_val_mase = float("inf")
-    best_overall_val_loss = float("inf")
     best_overall_seed = None
-    best_overall_ckpt = parent_run_dir / "best_overall.ckpt"
+    best_overall_model_path = None
 
-    for seed_value in seed_list:
-        run_dir = parent_run_dir / f"seed_{seed_value}"
+    for seed_offset in range(NUM_SEEDS):
+        current_seed = int(BASE_SEED) + int(seed_offset)
+        run_dir = parent_run_dir / f"seed_{current_seed}"
         run_dir.mkdir(parents=True, exist_ok=True)
 
-        summary = train_one_seed(
+        seed_summary = train_one_seed(
             df=df,
             mase_denoms=mase_denoms,
             run_dir=run_dir,
-            seed_value=seed_value,
+            seed_value=current_seed,
+            hpo_params=best_hyperparameters,
         )
+        all_seed_summaries.append(seed_summary)
 
-        if np.isfinite(summary["val_mase"]) and summary["val_mase"] < best_overall_val_mase:
-            best_overall_val_mase = float(summary["val_mase"])
-            best_overall_val_loss = float(summary["best_val_loss"]) if summary["best_val_loss"] is not None else float("inf")
-            best_overall_seed = int(seed_value)
-            best_path = summary["best_model_path"]
-            if best_path:
-                best_overall_ckpt.write_bytes(Path(best_path).read_bytes())
-        elif not np.isfinite(summary["val_mase"]):
-            if summary["best_val_loss"] is not None and float(summary["best_val_loss"]) < best_overall_val_loss:
-                best_overall_val_loss = float(summary["best_val_loss"])
-                best_overall_seed = int(seed_value)
-                best_path = summary["best_model_path"]
-                if best_path:
-                    best_overall_ckpt.write_bytes(Path(best_path).read_bytes())
+        if np.isfinite(seed_summary["val_mase"]) and seed_summary["val_mase"] < best_overall_val_mase:
+            best_overall_val_mase = float(seed_summary["val_mase"])
+            best_overall_seed = int(current_seed)
+            best_overall_model_path = seed_summary["best_model_path"]
 
-    save_json(parent_run_dir / "best_overall.json", {
-        "best_seed": best_overall_seed,
-        "best_val_mase": float(best_overall_val_mase),
-        "best_val_loss": float(best_overall_val_loss),
-        "best_checkpoint_path": str(best_overall_ckpt),
-    })
+    overall_summary = {
+        "best_overall_seed": best_overall_seed,
+        "best_overall_val_mase": float(best_overall_val_mase),
+        "best_overall_model_path": best_overall_model_path,
+        "seed_summaries": all_seed_summaries,
+        "optuna_best_params": best_hyperparameters,
+    }
+    save_json(parent_run_dir / "overall_summary.json", overall_summary)
 
-    print("Saved multi-seed run to:", parent_run_dir)
+    print("Saved:", parent_run_dir / "overall_summary.json")
 
 
 if __name__ == "__main__":
