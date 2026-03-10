@@ -63,7 +63,7 @@ HIDDEN_CONT_SIZE = 16
 DROPOUT = 0.1
 
 LR_PATIENCE = 3
-PATIENCE = 3
+PATIENCE = 6
 
 
 # -----------------------------------------------------------------------------
@@ -723,7 +723,7 @@ def main():
     }
 
     ts = time.strftime("%Y%m%d-%H%M%S")
-    parent_run_dir = RUNS_DIR / f"{ts}_MultiSeed_TFT_fast_comparable__base_seed={BASE_SEED}__num_seeds={NUM_SEEDS}"
+    parent_run_dir = RUNS_DIR / f"{ts}_TFT_seed={BASE_SEED}__num_seeds={NUM_SEEDS}"
     parent_run_dir.mkdir(parents=True, exist_ok=True)
     save_json(parent_run_dir / "config.json", config)
     save_json(parent_run_dir / "system_info.json", get_system_info())
