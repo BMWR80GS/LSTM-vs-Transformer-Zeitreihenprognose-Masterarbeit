@@ -49,7 +49,7 @@ MAX_SERIES = 200
 ENCODER_LEN = 56
 PRED_LEN = 28
 HORIZON = PRED_LEN
-MAX_EPOCHS = 1
+MAX_EPOCHS = 2
 
 
 # -----------------------------------------------------------------------------
@@ -69,8 +69,8 @@ PATIENCE = 6
 # -----------------------------------------------------------------------------
 # Optuna
 # -----------------------------------------------------------------------------
-USE_OPTUNA = True
-OPTUNA_TRIALS = 2
+USE_OPTUNA = False
+OPTUNA_TRIALS = 1
 OPTUNA_TIMEOUT_SEC = None
 OPTUNA_SEEDS_PER_TRIAL = 1
 OPTUNA_DIRECTION = "minimize"
@@ -85,7 +85,6 @@ LAG_LIST = [1, 7, 14, 28]
 ROLLING_WINDOWS = [7, 28]
 
 KNOWN_REAL_FEATURES = [
-    "time_idx",
     "price_s",
     "price_missing",
     "snap",
@@ -283,6 +282,78 @@ def eval_mase_mse_wape_weekly_from_arrays(pred_y, true_y, series_ids, mase_denom
     }
 
 
+def compute_feature_importance(model, raw_predictions, training_ds):
+    """
+    Berechnet die interne Feature Importance des TFT.
+
+    Wichtig:
+    - Der Encoder sieht andere Features als der Decoder.
+    - Deshalb werden Encoder- und Decoder-Importances separat aufgebaut
+      und anschließend über den Feature-Namen zusammengeführt.
+    """
+
+    # Interne TFT-Interpretation aus den rohen Modell-Outputs berechnen
+    interpretation = model.interpret_output(raw_predictions.output, reduction="mean")
+
+    encoder_weights = interpretation["encoder_variables"]
+    decoder_weights = interpretation["decoder_variables"]
+
+    if isinstance(encoder_weights, torch.Tensor):
+        encoder_weights = encoder_weights.detach().cpu().numpy()
+    if isinstance(decoder_weights, torch.Tensor):
+        decoder_weights = decoder_weights.detach().cpu().numpy()
+
+    encoder_weights = np.asarray(encoder_weights, dtype=np.float32).reshape(-1)
+    decoder_weights = np.asarray(decoder_weights, dtype=np.float32).reshape(-1)
+
+    # Feature-Namen direkt aus dem TimeSeriesDataSet lesen
+    # Das ist robuster als known_reals + unknown_reals manuell zu kombinieren.
+    encoder_feature_names = list(training_ds.reals)
+
+    # Decoder sieht nur bekannte Features in der Zukunft.
+    # relative_time_idx, encoder_length und target_scales können intern zusätzlich auftauchen.
+    # Deshalb nehmen wir die letzten N Encoder-Features nur dann nicht,
+    # sondern bauen die Decoder-Liste explizit aus den im Dataset definierten known reals.
+    decoder_feature_names = list(training_ds.time_varying_known_reals)
+
+    # Falls interne Zusatzfeatures auch im Decoder auftauchen, Länge angleichen
+    if len(decoder_feature_names) != len(decoder_weights):
+        decoder_feature_names = encoder_feature_names[:len(decoder_weights)]
+
+    # Falls Encoder zusätzliche interne Reals hat, Länge angleichen
+    if len(encoder_feature_names) != len(encoder_weights):
+        encoder_feature_names = encoder_feature_names[:len(encoder_weights)]
+
+    df_encoder = pd.DataFrame({
+        "feature": encoder_feature_names,
+        "encoder_importance": encoder_weights,
+    })
+
+    df_decoder = pd.DataFrame({
+        "feature": decoder_feature_names,
+        "decoder_importance": decoder_weights,
+    })
+
+    df_importance = pd.merge(
+        df_encoder,
+        df_decoder,
+        on="feature",
+        how="outer"
+    ).fillna(0.0)
+
+    df_importance["total_importance"] = (
+        df_importance["encoder_importance"] +
+        df_importance["decoder_importance"]
+    )
+
+    df_importance = df_importance.sort_values(
+        "total_importance",
+        ascending=False
+    ).reset_index(drop=True)
+
+    return df_importance
+
+
 def build_timeseries_datasets(df: pd.DataFrame):
     df = df.copy()
     df["series_id"] = df["series_id"].astype(str)
@@ -319,9 +390,9 @@ def build_timeseries_datasets(df: pd.DataFrame):
         time_varying_known_reals=known_reals,
         time_varying_unknown_reals=unknown_reals,
         target_normalizer=GroupNormalizer(groups=["series_id"]),
-        add_relative_time_idx=True,
-        add_target_scales=True,
-        add_encoder_length=True,
+        add_relative_time_idx=False,  # diese drei speziellen Features für den TFT werden nicht aktiviert um eine bessere Vergleichbarkeit der Modelle zu gewährleisten.
+        add_target_scales=False,
+        add_encoder_length=False,
         allow_missing_timesteps=False,
     )
 
@@ -333,15 +404,15 @@ def build_timeseries_datasets(df: pd.DataFrame):
         min_prediction_idx=train_cutoff + 1,
     )
 
-    test = TimeSeriesDataSet.from_dataset(
-        training,
-        df[df.time_idx <= test_cutoff],
-        predict=True,
-        stop_randomization=True,
-        min_prediction_idx=val_cutoff + 1,
-    )
+    # test = TimeSeriesDataSet.from_dataset(
+    #     training,
+    #     df[df.time_idx <= test_cutoff],
+    #     predict=True,
+    #     stop_randomization=True,
+    #     min_prediction_idx=val_cutoff + 1,
+    # )
 
-    return training, validation, test
+    return training, validation, #test
 
 
 # def save_forecast_example(model, test_loader, out_path: Path) -> None:
@@ -450,7 +521,8 @@ def train_one_seed(
     save_json(run_dir / "config.json", seed_config)
     save_json(run_dir / "system_info.json", get_system_info())
 
-    training_ds, val_ds, test_ds = build_timeseries_datasets(df)
+    #training_ds, val_ds, test_ds = build_timeseries_datasets(df)
+    training_ds, val_ds = build_timeseries_datasets(df)
     series_mapping = get_series_id_mapping(training_ds)
 
     train_loader = training_ds.to_dataloader(
@@ -512,9 +584,9 @@ def train_one_seed(
         logger=csv_logger,
         callbacks=[ckpt, early],
         log_every_n_steps=70,
-        enable_progress_bar=False,
+        enable_progress_bar=True,
         enable_model_summary=False,
-        profiler="Simple",
+        profiler=None,
     )
 
     total_start = time.perf_counter()
@@ -611,12 +683,53 @@ def train_one_seed(
 
     save_plots(run_dir, epoch_rows)
 
+    # Feature Importance berechnen
+    feature_importance_df = compute_feature_importance(
+        model=model,
+        raw_predictions=val_raw,
+        training_ds=training_ds
+    )
+
+    # CSV speichern
+    feature_importance_df.to_csv(
+        run_dir / "tft_feature_importance.csv",
+        index=False
+    )
+
+    # -------------------------------------------------------
+    # Plot erstellen
+    # -------------------------------------------------------
+
+    import matplotlib.pyplot as plt
+
+    plt.figure(figsize=(8, 6))
+
+    feature_importance_df.sort_values("total_importance").plot(
+        x="feature",
+        y="total_importance",
+        kind="barh",
+        legend=False
+    )
+
+    plt.xlabel("Feature Importance")
+    plt.ylabel("Feature")
+    plt.title("TFT Feature Importance")
+
+    plt.tight_layout()
+
+    plt.savefig(
+        run_dir / "tft_feature_importance.png",
+        dpi=150
+    )
+
+    plt.close()
+
     summary = {
         "seed": int(seed_value),
         "best_model_path": best_path,
         "best_val_loss": float(ckpt.best_model_score) if ckpt.best_model_score is not None else None,
         "total_time_sec": float(total_time),
-        "epochs_ran": int(trainer.current_epoch) + 1,
+        "epochs_ran": int(trainer.current_epoch),
         "val_mase": float(val_metrics["mase"]),
         "val_mase_w1": float(val_metrics["mase_w1"]),
         "val_mase_w2": float(val_metrics["mase_w2"]),
@@ -689,6 +802,11 @@ def main():
     df = add_time_series_features(df)
 
     known_reals, unknown_reals = build_feature_columns()
+
+    # Alle kontinuierlichen Features (Encoder + Decoder)
+    # Diese Liste wird für die Feature Importance genutzt
+    all_features = known_reals + unknown_reals
+
     required_cols = ["series_id", "item_id", "store_id", "state_id", "time_idx", "split", "y_log"] + known_reals + unknown_reals
     missing_cols = [col for col in dict.fromkeys(required_cols) if col not in df.columns]
     if missing_cols:
@@ -732,7 +850,7 @@ def main():
         optuna_run_dir = parent_run_dir / "optuna"
         optuna_run_dir.mkdir(parents=True, exist_ok=True)
 
-        objective_function = objective_factory(df=df, mase_denoms=mase_denoms, optuna_base_dir=optuna_run_dir)
+        objective_function = objective_factory(df=df, mase_denoms=mase_denoms, optuna_base_dir=optuna_run_dir, all_features=all_features)
         optuna_study = optuna.create_study(direction=OPTUNA_DIRECTION)
         optuna_study.optimize(objective_function, n_trials=OPTUNA_TRIALS, timeout=OPTUNA_TIMEOUT_SEC)
 
