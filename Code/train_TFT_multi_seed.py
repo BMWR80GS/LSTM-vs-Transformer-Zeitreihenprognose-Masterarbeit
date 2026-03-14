@@ -49,7 +49,7 @@ MAX_SERIES = 200
 ENCODER_LEN = 56
 PRED_LEN = 28
 HORIZON = PRED_LEN
-MAX_EPOCHS = 2
+MAX_EPOCHS = 1
 
 
 # -----------------------------------------------------------------------------
@@ -57,8 +57,8 @@ MAX_EPOCHS = 2
 # -----------------------------------------------------------------------------
 BATCH_SIZE = 2048
 LR = 5e-4
-HIDDEN_SIZE = 32
-ATTN_HEAD_SIZE = 4
+HIDDEN_SIZE = 16
+ATTN_HEAD_SIZE = 2
 HIDDEN_CONT_SIZE = 16
 DROPOUT = 0.1
 
@@ -282,6 +282,88 @@ def eval_mase_mse_wape_weekly_from_arrays(pred_y, true_y, series_ids, mase_denom
     }
 
 
+class TFT(TemporalFusionTransformer):
+    def __init__(self, *args, mase_denoms=None, series_mapping=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.mase_denoms = mase_denoms or {}
+        self.series_mapping = series_mapping
+        self._val_pred_batches = []
+        self._val_true_batches = []
+        self._val_series_batches = []
+
+    def on_validation_epoch_start(self):
+        self._val_pred_batches = []
+        self._val_true_batches = []
+        self._val_series_batches = []
+
+    def validation_step(self, batch, batch_idx):
+        # Standard-Validierung von PyTorch Forecasting / Lightning beibehalten
+        out = super().validation_step(batch, batch_idx)
+
+        if self.trainer is not None and self.trainer.sanity_checking:
+            return out
+
+        x, y = batch
+
+        if isinstance(y, (tuple, list)):
+            y_true_log = y[0]
+        else:
+            y_true_log = y
+
+        # Zweiter Forward nur für die Zusatzmetriken
+        network_out = self(x)
+
+        pred_log = extract_point_forecast(
+            network_out["prediction"].float().detach().cpu().numpy()
+        )
+        true_log = y_true_log.detach().cpu().numpy()
+
+        pred_y = np.expm1(pred_log).clip(min=0.0)
+        true_y = np.expm1(true_log).clip(min=0.0)
+
+        series_ids = extract_series_ids_from_raw_x(x, self.series_mapping)
+
+        self._val_pred_batches.append(pred_y)
+        self._val_true_batches.append(true_y)
+        self._val_series_batches.append(series_ids)
+
+        return out
+
+    def on_validation_epoch_end(self):
+        super().on_validation_epoch_end()
+
+        if self.trainer is not None and self.trainer.sanity_checking:
+            return
+
+        if not self._val_pred_batches:
+            return
+
+        pred_y = np.concatenate(self._val_pred_batches, axis=0)
+        true_y = np.concatenate(self._val_true_batches, axis=0)
+        series_ids = np.concatenate(self._val_series_batches, axis=0)
+
+        metrics = eval_mase_mse_wape_weekly_from_arrays(
+            pred_y=pred_y,
+            true_y=true_y,
+            series_ids=series_ids,
+            mase_denoms=self.mase_denoms,
+        )
+
+        self.log("val_mase", float(metrics["mase"]), on_epoch=True, prog_bar=False, logger=True)
+        self.log("val_mase_w1", float(metrics["mase_w1"]), on_epoch=True, prog_bar=False, logger=True)
+        self.log("val_mase_w2", float(metrics["mase_w2"]), on_epoch=True, prog_bar=False, logger=True)
+        self.log("val_mase_w3", float(metrics["mase_w3"]), on_epoch=True, prog_bar=False, logger=True)
+        self.log("val_mase_w4", float(metrics["mase_w4"]), on_epoch=True, prog_bar=False, logger=True)
+
+        self.log("val_wape", float(metrics["wape"]), on_epoch=True, prog_bar=False, logger=True)
+        self.log("val_wape_w1", float(metrics["wape_w1"]), on_epoch=True, prog_bar=False, logger=True)
+        self.log("val_wape_w2", float(metrics["wape_w2"]), on_epoch=True, prog_bar=False, logger=True)
+        self.log("val_wape_w3", float(metrics["wape_w3"]), on_epoch=True, prog_bar=False, logger=True)
+        self.log("val_wape_w4", float(metrics["wape_w4"]), on_epoch=True, prog_bar=False, logger=True)
+
+        self.log("val_mse", float(metrics["mse"]), on_epoch=True, prog_bar=False, logger=True)
+
+
 def compute_feature_importance(model, raw_predictions, training_ds):
     """
     Berechnet die interne Feature Importance des TFT.
@@ -352,6 +434,84 @@ def compute_feature_importance(model, raw_predictions, training_ds):
     ).reset_index(drop=True)
 
     return df_importance
+
+def compute_attention_importance(model, raw_predictions):
+    """
+    Berechnet die mittlere TFT-Attention über alle Validierungsbeispiele.
+
+    Rückgabe:
+    - DataFrame mit Attention-Gewicht je Decoder-Schritt
+    - zusätzlich das rohe gemittelte Attention-Array
+    """
+
+    interpretation = model.interpret_output(raw_predictions.output, reduction="mean")
+
+    attention = interpretation.get("attention", None)
+    if attention is None:
+        raise KeyError("Kein 'attention'-Eintrag in der TFT-Interpretation gefunden.")
+
+    if isinstance(attention, torch.Tensor):
+        attention = attention.detach().float().cpu().numpy()
+
+    attention = np.asarray(attention, dtype=np.float32)
+
+    # Erwartung meist: [decoder_horizon, encoder_length]
+    # Falls noch zusätzliche Dimensionen vorhanden sind, robust mitteln
+    while attention.ndim > 2:
+        attention = attention.mean(axis=0)
+
+     # Fall 1: nur Encoder-Achse vorhanden, z. B. (56,)
+    if attention.ndim == 1:
+        encoder_positions = np.arange(-attention.shape[0] + 1, 1)
+
+        attention_long_df = pd.DataFrame({
+            "decoder_step": 1,
+            "encoder_relative_pos": encoder_positions,
+            "attention_weight": attention,
+        })
+
+        # Für Heatmap 2D machen: eine Zeile
+        attention_matrix = attention[np.newaxis, :]
+
+        return attention_long_df, attention_matrix
+
+    if attention.ndim != 2:
+        raise ValueError(f"Unerwartete Attention-Form: {attention.shape}")
+
+    decoder_steps = np.arange(1, attention.shape[0] + 1)
+    encoder_positions = np.arange(-attention.shape[1] + 1, 1)
+
+    attention_df = pd.DataFrame(attention, index=decoder_steps, columns=encoder_positions)
+    attention_df.index.name = "decoder_step"
+
+    attention_long_df = (
+        attention_df.reset_index()
+        .melt(id_vars="decoder_step", var_name="encoder_relative_pos", value_name="attention_weight")
+        .sort_values(["decoder_step", "encoder_relative_pos"])
+        .reset_index(drop=True)
+    )
+
+    return attention_long_df, attention
+
+def save_attention_plot(attention_matrix: np.ndarray, out_path: Path) -> None:
+    """
+    Speichert die gemittelte TFT-Attention als Säulendiagramm.
+    Zeilen: Decoder-Schritte
+    Spalten: Encoder-Positionen relativ zum Forecast-Start
+    """
+
+    attention = np.asarray(attention_matrix, dtype=float).ravel()
+    encoder_len = attention.shape[0]
+    encoder_positions = np.arange(-encoder_len + 1, 1)
+
+    plt.figure(figsize=(10, 4))
+    plt.bar(encoder_positions, attention, width=0.8)
+    plt.xlabel("Encoder position")
+    plt.ylabel("Attention weight")
+    plt.title("TFT Attention per Encoder step (mean all Series)")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close()
 
 
 def build_timeseries_datasets(df: pd.DataFrame):
@@ -547,7 +707,7 @@ def train_one_seed(
     #     pin_memory=(TORCH_DEVICE == "cuda"),
     # )
 
-    model = TemporalFusionTransformer.from_dataset(
+    model = TFT.from_dataset(
         training_ds,
         learning_rate=learning_rate,
         hidden_size=hidden_size,
@@ -564,13 +724,13 @@ def train_one_seed(
     ckpt = ModelCheckpoint(
         dirpath=str(run_dir),
         filename="best",
-        monitor="val_loss",
+        monitor="val_mase",
         save_top_k=1,
         mode="min",
     )
 
     early = EarlyStopping(
-        monitor="val_loss",
+        monitor="val_mase",
         patience=PATIENCE,
         mode="min",
     )
@@ -595,7 +755,11 @@ def train_one_seed(
 
     best_path = ckpt.best_model_path
     if best_path:
-        model = TemporalFusionTransformer.load_from_checkpoint(best_path)
+        model = TFT.load_from_checkpoint(
+            best_path,
+            mase_denoms=mase_denoms,
+            series_mapping=series_mapping,
+        )
 
     metrics_csv = Path(csv_logger.log_dir) / "metrics.csv"
     epoch_rows = []
@@ -605,47 +769,61 @@ def train_one_seed(
         for ep in epochs:
             subset = log_df[log_df["epoch"] == ep]
 
-            train_loss = np.nan
-            val_loss = np.nan
-            lr_value = float(learning_rate)
+            row = {
+                "epoch": ep + 1,
+                "train_loss": np.nan,
+                "val_loss": np.nan,
+                "val_mase": np.nan,
+                "val_mase_w1": np.nan,
+                "val_mase_w2": np.nan,
+                "val_mase_w3": np.nan,
+                "val_mase_w4": np.nan,
+                "val_wape": np.nan,
+                "val_wape_w1": np.nan,
+                "val_wape_w2": np.nan,
+                "val_wape_w3": np.nan,
+                "val_wape_w4": np.nan,
+                "val_mse": np.nan,
+                "lr": float(learning_rate),
+                "epoch_time_sec": np.nan,
+            }
 
-            for train_key in ["train_loss_epoch", "train_loss"]:
+            for train_key in ["train_loss_epoch", "train_loss", "train_loss_step"]:
                 if train_key in subset.columns:
                     tmp = subset[train_key].dropna()
                     if len(tmp) > 0:
-                        train_loss = float(tmp.iloc[-1])
+                        row["train_loss"] = float(tmp.iloc[-1])
                         break
 
-            if "val_loss" in subset.columns:
-                tmp = subset["val_loss"].dropna()
-                if len(tmp) > 0:
-                    val_loss = float(tmp.iloc[-1])
+            for col in [
+                "val_loss",
+                "val_mase",
+                "val_mase_w1",
+                "val_mase_w2",
+                "val_mase_w3",
+                "val_mase_w4",
+                "val_wape",
+                "val_wape_w1",
+                "val_wape_w2",
+                "val_wape_w3",
+                "val_wape_w4",
+                "val_mse",
+            ]:
+                if col in subset.columns:
+                    tmp = subset[col].dropna()
+                    if len(tmp) > 0:
+                        row[col] = float(tmp.iloc[-1])
 
             for lr_key in ["lr-Adam", "lr"]:
                 if lr_key in subset.columns:
                     tmp = subset[lr_key].dropna()
                     if len(tmp) > 0:
-                        lr_value = float(tmp.iloc[-1])
+                        row["lr"] = float(tmp.iloc[-1])
                         break
 
-            epoch_rows.append(
-                {
-                    "epoch": ep + 1,
-                    "train_loss": train_loss,
-                    "val_loss": val_loss,
-                    "lr": lr_value,
-                    "epoch_time_sec": np.nan,
-                }
-            )
+            epoch_rows.append(row)
 
     val_raw = model.predict(val_loader, mode="raw", return_x=True)
-    val_preds = extract_point_forecast(val_raw.output.prediction.detach().cpu().numpy())
-    val_true_log = val_raw.x["decoder_target"].detach().cpu().numpy()
-    val_pred_y = np.expm1(val_preds).clip(min=0.0)
-    val_true_y = np.expm1(val_true_log).clip(min=0.0)
-    val_series_ids = extract_series_ids_from_raw_x(val_raw.x, series_mapping)
-    val_metrics = eval_mase_mse_wape_weekly_from_arrays(val_pred_y, val_true_y, val_series_ids, mase_denoms)
-    external_val_loss = eval_loss_logspace_from_raw(val_raw)
 
     # test_raw = model.predict(test_loader, mode="raw", return_x=True)
     # test_preds = extract_point_forecast(test_raw.output.prediction.detach().cpu().numpy())
@@ -660,22 +838,21 @@ def train_one_seed(
             "epoch": 1,
             "train_loss": np.nan,
             "val_loss": np.nan,
+            "val_mase": np.nan,
+            "val_mase_w1": np.nan,
+            "val_mase_w2": np.nan,
+            "val_mase_w3": np.nan,
+            "val_mase_w4": np.nan,
+            "val_wape": np.nan,
+            "val_wape_w1": np.nan,
+            "val_wape_w2": np.nan,
+            "val_wape_w3": np.nan,
+            "val_wape_w4": np.nan,
+            "val_mse": np.nan,
             "lr": float(learning_rate),
             "epoch_time_sec": float(total_time),
         }]
 
-    epoch_rows[-1]["val_loss"] = float(external_val_loss)
-    epoch_rows[-1]["val_mase"] = float(val_metrics["mase"])
-    epoch_rows[-1]["val_mase_w1"] = float(val_metrics["mase_w1"])
-    epoch_rows[-1]["val_mase_w2"] = float(val_metrics["mase_w2"])
-    epoch_rows[-1]["val_mase_w3"] = float(val_metrics["mase_w3"])
-    epoch_rows[-1]["val_mase_w4"] = float(val_metrics["mase_w4"])
-    epoch_rows[-1]["val_wape"] = float(val_metrics["wape"])
-    epoch_rows[-1]["val_wape_w1"] = float(val_metrics["wape_w1"])
-    epoch_rows[-1]["val_wape_w2"] = float(val_metrics["wape_w2"])
-    epoch_rows[-1]["val_wape_w3"] = float(val_metrics["wape_w3"])
-    epoch_rows[-1]["val_wape_w4"] = float(val_metrics["wape_w4"])
-    epoch_rows[-1]["val_mse"] = float(val_metrics["mse"])
     epoch_rows[-1]["epoch_time_sec"] = float(total_time / max(len(epoch_rows), 1))
 
     metrics_dataframe = reorder_metrics_columns(pd.DataFrame(epoch_rows))
@@ -694,6 +871,22 @@ def train_one_seed(
     feature_importance_df.to_csv(
         run_dir / "tft_feature_importance.csv",
         index=False
+    )
+
+    # Attention Interpretierbarkeit berechnen
+    attention_long_df, attention_matrix = compute_attention_importance(
+        model=model,
+        raw_predictions=val_raw,
+    )
+
+    attention_long_df.to_csv(
+        run_dir / "tft_attention.csv",
+        index=False
+    )
+
+    save_attention_plot(
+        attention_matrix=attention_matrix,
+        out_path=run_dir / "tft_attention.png"
     )
 
     # -------------------------------------------------------
@@ -724,23 +917,25 @@ def train_one_seed(
 
     plt.close()
 
+    last_epoch_row = epoch_rows[-1] if epoch_rows else {}
+
     summary = {
         "seed": int(seed_value),
         "best_model_path": best_path,
         "best_val_loss": float(ckpt.best_model_score) if ckpt.best_model_score is not None else None,
         "total_time_sec": float(total_time),
-        "epochs_ran": int(trainer.current_epoch),
-        "val_mase": float(val_metrics["mase"]),
-        "val_mase_w1": float(val_metrics["mase_w1"]),
-        "val_mase_w2": float(val_metrics["mase_w2"]),
-        "val_mase_w3": float(val_metrics["mase_w3"]),
-        "val_mase_w4": float(val_metrics["mase_w4"]),
-        "val_wape": float(val_metrics["wape"]),
-        "val_wape_w1": float(val_metrics["wape_w1"]),
-        "val_wape_w2": float(val_metrics["wape_w2"]),
-        "val_wape_w3": float(val_metrics["wape_w3"]),
-        "val_wape_w4": float(val_metrics["wape_w4"]),
-        "val_mse": float(val_metrics["mse"]),
+        "epochs_ran": int(len(epoch_rows)),
+        "val_mase": float(last_epoch_row["val_mase"]) if pd.notna(last_epoch_row.get("val_mase", np.nan)) else None,
+        "val_mase_w1": float(last_epoch_row["val_mase_w1"]) if pd.notna(last_epoch_row.get("val_mase_w1", np.nan)) else None,
+        "val_mase_w2": float(last_epoch_row["val_mase_w2"]) if pd.notna(last_epoch_row.get("val_mase_w2", np.nan)) else None,
+        "val_mase_w3": float(last_epoch_row["val_mase_w3"]) if pd.notna(last_epoch_row.get("val_mase_w3", np.nan)) else None,
+        "val_mase_w4": float(last_epoch_row["val_mase_w4"]) if pd.notna(last_epoch_row.get("val_mase_w4", np.nan)) else None,
+        "val_wape": float(last_epoch_row["val_wape"]) if pd.notna(last_epoch_row.get("val_wape", np.nan)) else None,
+        "val_wape_w1": float(last_epoch_row["val_wape_w1"]) if pd.notna(last_epoch_row.get("val_wape_w1", np.nan)) else None,
+        "val_wape_w2": float(last_epoch_row["val_wape_w2"]) if pd.notna(last_epoch_row.get("val_wape_w2", np.nan)) else None,
+        "val_wape_w3": float(last_epoch_row["val_wape_w3"]) if pd.notna(last_epoch_row.get("val_wape_w3", np.nan)) else None,
+        "val_wape_w4": float(last_epoch_row["val_wape_w4"]) if pd.notna(last_epoch_row.get("val_wape_w4", np.nan)) else None,
+        "val_mse": float(last_epoch_row["val_mse"]) if pd.notna(last_epoch_row.get("val_mse", np.nan)) else None,
         # "test_mase": float(test_metrics["mase"]),
         # "test_mase_w1": float(test_metrics["mase_w1"]),
         # "test_mase_w2": float(test_metrics["mase_w2"]),
@@ -850,7 +1045,7 @@ def main():
         optuna_run_dir = parent_run_dir / "optuna"
         optuna_run_dir.mkdir(parents=True, exist_ok=True)
 
-        objective_function = objective_factory(df=df, mase_denoms=mase_denoms, optuna_base_dir=optuna_run_dir, all_features=all_features)
+        objective_function = objective_factory(df=df, mase_denoms=mase_denoms, optuna_base_dir=optuna_run_dir)
         optuna_study = optuna.create_study(direction=OPTUNA_DIRECTION)
         optuna_study.optimize(objective_function, n_trials=OPTUNA_TRIALS, timeout=OPTUNA_TIMEOUT_SEC)
 
