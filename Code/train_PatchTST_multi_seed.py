@@ -1,4 +1,5 @@
 import json
+import math
 import time
 from pathlib import Path
 
@@ -6,6 +7,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 torch.set_float32_matmul_precision("medium")
 
@@ -18,12 +21,11 @@ from optuna.visualization import (
 )
 
 import lightning.pytorch as pl
-from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
+from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger
 
-from pytorch_forecasting import TemporalFusionTransformer, TimeSeriesDataSet
+from pytorch_forecasting import TimeSeriesDataSet
 from pytorch_forecasting.data import GroupNormalizer
-from pytorch_forecasting.metrics import QuantileLoss
 
 from run_logger import get_system_info, save_excel, save_json, save_plots
 
@@ -33,7 +35,7 @@ from run_logger import get_system_info, save_excel, save_json, save_plots
 # -----------------------------------------------------------------------------
 PREP_DIR = Path("data") / "preprocessed"
 CSV_PATH = PREP_DIR / "m5_long.csv"
-RUNS_DIR = Path("runs") / "tft"
+RUNS_DIR = Path("runs") / "patchtst"
 
 
 # -----------------------------------------------------------------------------
@@ -49,7 +51,7 @@ MAX_SERIES = 200
 ENCODER_LEN = 56
 PRED_LEN = 28
 HORIZON = PRED_LEN
-MAX_EPOCHS = 15
+MAX_EPOCHS = 12
 
 
 # -----------------------------------------------------------------------------
@@ -59,19 +61,24 @@ BATCH_SIZE = 2048
 LR = 5e-3
 HIDDEN_SIZE = 16
 ATTN_HEAD_SIZE = 4
-HIDDEN_CONT_SIZE = 16
+HIDDEN_CONT_SIZE = 32
 DROPOUT = 0.1
 
-LR_PATIENCE = 1
-LR_Factor = 0.5
+PATCH_LEN = 8
+PATCH_STRIDE = 4
+NUM_TRANSFORMER_LAYERS = 2
+SERIES_EMB_DIM = 16
+
+LR_PATIENCE = 2
 PATIENCE = 4
 MIN_DELTA = 0.001
+
 
 # -----------------------------------------------------------------------------
 # Optuna
 # -----------------------------------------------------------------------------
 USE_OPTUNA = False
-OPTUNA_TRIALS = 5
+OPTUNA_TRIALS = 1
 OPTUNA_TIMEOUT_SEC = None
 OPTUNA_SEEDS_PER_TRIAL = 1
 OPTUNA_DIRECTION = "minimize"
@@ -107,10 +114,12 @@ def set_seed(seed: int) -> None:
     pl.seed_everything(seed, workers=False)
 
 
+
 def load_preprocessed() -> pd.DataFrame:
     if not CSV_PATH.exists():
         raise FileNotFoundError("Keine vorverarbeitete Datei gefunden (m5_long.csv).")
     return pd.read_csv(CSV_PATH, parse_dates=["date"])
+
 
 
 def add_time_series_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -144,12 +153,14 @@ def add_time_series_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+
 def build_feature_columns() -> tuple[list, list]:
     unknown_reals = ["y_log"]
     unknown_reals += [f"y_log_lag_{lag}" for lag in LAG_LIST]
     unknown_reals += [f"y_log_roll_mean_{window}" for window in ROLLING_WINDOWS]
     unknown_reals += [f"y_log_roll_std_{window}" for window in ROLLING_WINDOWS]
     return KNOWN_REAL_FEATURES.copy(), unknown_reals
+
 
 
 def compute_mase_denominators(train_df: pd.DataFrame, seasonality: int = 7) -> dict:
@@ -171,6 +182,7 @@ def compute_mase_denominators(train_df: pd.DataFrame, seasonality: int = 7) -> d
     return denominators
 
 
+
 def get_series_id_mapping(training_ds: TimeSeriesDataSet):
     mapping = None
     if hasattr(training_ds, "categorical_encoders"):
@@ -185,6 +197,7 @@ def get_series_id_mapping(training_ds: TimeSeriesDataSet):
             if classes is not None:
                 mapping = {int(i): str(v) for i, v in enumerate(classes)}
     return mapping
+
 
 
 def extract_series_ids_from_raw_x(raw_x, series_mapping) -> np.ndarray:
@@ -220,6 +233,7 @@ def extract_series_ids_from_raw_x(raw_x, series_mapping) -> np.ndarray:
     return np.asarray(series_ids, dtype=object)
 
 
+
 def extract_point_forecast(prediction_array: np.ndarray) -> np.ndarray:
     predictions = np.asarray(prediction_array)
     if predictions.ndim == 3 and predictions.shape[2] > 1:
@@ -229,10 +243,10 @@ def extract_point_forecast(prediction_array: np.ndarray) -> np.ndarray:
     return predictions
 
 
-def eval_loss_logspace_from_raw(raw_prediction) -> float:
-    pred_y_log = extract_point_forecast(raw_prediction.output.prediction.detach().cpu().numpy())
-    true_y_log = raw_prediction.x["decoder_target"].detach().cpu().numpy()
+
+def eval_loss_logspace_from_arrays(pred_y_log: np.ndarray, true_y_log: np.ndarray) -> float:
     return float(np.mean((pred_y_log - true_y_log) ** 2))
+
 
 
 def eval_mase_mse_wape_weekly_from_arrays(pred_y, true_y, series_ids, mase_denoms):
@@ -283,41 +297,217 @@ def eval_mase_mse_wape_weekly_from_arrays(pred_y, true_y, series_ids, mase_denom
     }
 
 
-class TFT_Model(TemporalFusionTransformer):
-    def __init__(self, *args, mase_denoms=None, series_mapping=None, **kwargs):
-        super().__init__(*args, **kwargs)
+
+def quantile_loss(prediction: torch.Tensor, target: torch.Tensor, quantiles: list[float]) -> torch.Tensor:
+    losses = []
+    for quantile_index, quantile in enumerate(quantiles):
+        errors = target - prediction[:, :, quantile_index]
+        losses.append(torch.maximum((quantile - 1.0) * errors, quantile * errors).unsqueeze(-1))
+    stacked_losses = torch.cat(losses, dim=-1)
+    return stacked_losses.mean()
+
+
+
+def move_batch_to_device(batch, device):
+    if isinstance(batch, dict):
+        return {key: move_batch_to_device(value, device) for key, value in batch.items()}
+    if isinstance(batch, (list, tuple)):
+        return type(batch)(move_batch_to_device(value, device) for value in batch)
+    if isinstance(batch, torch.Tensor):
+        return batch.to(device)
+    return batch
+
+
+
+class PatchTSTEncoderBlock(nn.Module):
+    def __init__(self, hidden_size: int, attention_head_size: int, dropout: float, ff_hidden_size: int):
+        super().__init__()
+        self.self_attention = nn.MultiheadAttention(
+            embed_dim=hidden_size,
+            num_heads=attention_head_size,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.norm_1 = nn.LayerNorm(hidden_size)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_size, ff_hidden_size),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(ff_hidden_size, hidden_size),
+        )
+        self.norm_2 = nn.LayerNorm(hidden_size)
+
+    def forward(self, hidden_states: torch.Tensor):
+        attention_output, attention_weights = self.self_attention(
+            hidden_states,
+            hidden_states,
+            hidden_states,
+            need_weights=True,
+            average_attn_weights=False,
+        )
+        hidden_states = self.norm_1(hidden_states + self.dropout(attention_output))
+        feed_forward_output = self.ffn(hidden_states)
+        hidden_states = self.norm_2(hidden_states + self.dropout(feed_forward_output))
+        return hidden_states, attention_weights
+
+
+
+class PatchTSTModel(pl.LightningModule):
+    def __init__(
+        self,
+        input_dim: int,
+        horizon: int,
+        num_series: int,
+        learning_rate: float,
+        hidden_size: int,
+        attention_head_size: int,
+        hidden_continuous_size: int,
+        dropout: float,
+        patch_len: int,
+        patch_stride: int,
+        num_transformer_layers: int,
+        series_emb_dim: int,
+        mase_denoms: dict,
+        series_mapping,
+        feature_names: list[str],
+        quantiles: list[float] | None = None,
+    ):
+        super().__init__()
+        self.save_hyperparameters(ignore=["mase_denoms", "series_mapping", "feature_names"])
+
+        self.input_dim = int(input_dim)
+        self.horizon = int(horizon)
+        self.num_series = int(num_series)
+        self.learning_rate = float(learning_rate)
+        self.hidden_size = int(hidden_size)
+        self.attention_head_size = int(attention_head_size)
+        self.hidden_continuous_size = int(hidden_continuous_size)
+        self.dropout_rate = float(dropout)
+        self.patch_len = int(patch_len)
+        self.patch_stride = int(patch_stride)
+        self.num_transformer_layers = int(num_transformer_layers)
+        self.series_emb_dim = int(series_emb_dim)
+        self.quantiles = quantiles or [0.1, 0.5, 0.9]
+        self.num_quantiles = len(self.quantiles)
+
         self.mase_denoms = mase_denoms or {}
         self.series_mapping = series_mapping
+        self.feature_names = list(feature_names)
+
+        self.series_embedding = nn.Embedding(self.num_series + 1, self.series_emb_dim)
+        self.input_norm = nn.LayerNorm(self.input_dim)
+        self.patch_projection = nn.Linear(self.patch_len * (self.input_dim + self.series_emb_dim), self.hidden_size)
+        self.positional_embedding = nn.Parameter(torch.randn(1, 256, self.hidden_size) * 0.02)
+        self.encoder_blocks = nn.ModuleList(
+            [
+                PatchTSTEncoderBlock(
+                    hidden_size=self.hidden_size,
+                    attention_head_size=self.attention_head_size,
+                    dropout=self.dropout_rate,
+                    ff_hidden_size=max(self.hidden_continuous_size, self.hidden_size * 2),
+                )
+                for _ in range(self.num_transformer_layers)
+            ]
+        )
+        self.encoder_norm = nn.LayerNorm(self.hidden_size)
+        self.output_head = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size),
+            nn.GELU(),
+            nn.Dropout(self.dropout_rate),
+            nn.Linear(self.hidden_size, self.horizon * self.num_quantiles),
+        )
+
         self._val_pred_batches = []
         self._val_true_batches = []
         self._val_series_batches = []
+        self._last_attention_weights = None
+
+    def make_patches(self, encoder_cont: torch.Tensor, series_ids: torch.Tensor) -> torch.Tensor:
+        encoder_cont = self.input_norm(encoder_cont)
+        series_emb = self.series_embedding(series_ids).unsqueeze(1).expand(-1, encoder_cont.size(1), -1)
+        encoder_inputs = torch.cat([encoder_cont, series_emb], dim=-1)
+
+        if encoder_inputs.size(1) < self.patch_len:
+            pad_len = self.patch_len - encoder_inputs.size(1)
+            encoder_inputs = F.pad(encoder_inputs, (0, 0, pad_len, 0))
+
+        patches = encoder_inputs.unfold(dimension=1, size=self.patch_len, step=self.patch_stride)
+        patches = patches.contiguous().permute(0, 1, 3, 2).reshape(encoder_inputs.size(0), -1, self.patch_len * encoder_inputs.size(2))
+        return patches
+
+    def forward(self, x: dict) -> dict:
+        encoder_cont = x["encoder_cont"].float()
+
+        group_values = x["groups"]
+        if group_values.ndim == 2:
+            group_values = group_values[:, 0]
+        series_ids = group_values.long()
+
+        patches = self.make_patches(encoder_cont, series_ids)
+        hidden_states = self.patch_projection(patches)
+
+        if hidden_states.size(1) > self.positional_embedding.size(1):
+            raise ValueError(
+                f"Zu viele Patches ({hidden_states.size(1)}). Erhöhe die maximale Positional-Embedding-Länge."
+            )
+
+        hidden_states = hidden_states + self.positional_embedding[:, : hidden_states.size(1), :]
+
+        attention_weights = None
+        for encoder_block in self.encoder_blocks:
+            hidden_states, attention_weights = encoder_block(hidden_states)
+
+        hidden_states = self.encoder_norm(hidden_states)
+        pooled_hidden = hidden_states.mean(dim=1)
+
+        prediction = self.output_head(pooled_hidden)
+        prediction = prediction.view(-1, self.horizon, self.num_quantiles)
+
+        if attention_weights is not None:
+            self._last_attention_weights = attention_weights.detach()
+
+        return {
+            "prediction": prediction,
+            "attention": attention_weights,
+        }
 
     def on_validation_epoch_start(self):
         self._val_pred_batches = []
         self._val_true_batches = []
         self._val_series_batches = []
 
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+        if isinstance(y, (tuple, list)):
+            y_true_log = y[0].float()
+        else:
+            y_true_log = y.float()
+
+        network_out = self(x)
+        loss = quantile_loss(network_out["prediction"], y_true_log, self.quantiles)
+
+        self.log("train_loss", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log("train_loss_step", loss, on_step=True, on_epoch=False, prog_bar=False, logger=True)
+        return loss
+
     def validation_step(self, batch, batch_idx):
-        # Standard-Validierung von PyTorch Forecasting / Lightning beibehalten
-        out = super().validation_step(batch, batch_idx)
+        x, y = batch
+        if isinstance(y, (tuple, list)):
+            y_true_log = y[0].float()
+        else:
+            y_true_log = y.float()
+
+        network_out = self(x)
+        prediction = network_out["prediction"]
+        val_loss = quantile_loss(prediction, y_true_log, self.quantiles)
+        self.log("val_loss", val_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
 
         if self.trainer is not None and self.trainer.sanity_checking:
-            return out
+            return val_loss
 
-        x, y = batch
-
-        if isinstance(y, (tuple, list)):
-            y_true_log = y[0]
-        else:
-            y_true_log = y
-
-        # Zweiter Forward nur für die Zusatzmetriken
-        network_out = self(x)
-
-        pred_log = extract_point_forecast(
-            network_out["prediction"].float().detach().cpu().numpy()
-        )
-        true_log = y_true_log.detach().cpu().numpy()
+        pred_log = extract_point_forecast(prediction.detach().float().cpu().numpy())
+        true_log = y_true_log.detach().float().cpu().numpy()
 
         pred_y = np.expm1(pred_log).clip(min=0.0)
         true_y = np.expm1(true_log).clip(min=0.0)
@@ -327,12 +517,9 @@ class TFT_Model(TemporalFusionTransformer):
         self._val_pred_batches.append(pred_y)
         self._val_true_batches.append(true_y)
         self._val_series_batches.append(series_ids)
-
-        return out
+        return val_loss
 
     def on_validation_epoch_end(self):
-        super().on_validation_epoch_end()
-
         if self.trainer is not None and self.trainer.sanity_checking:
             return
 
@@ -350,7 +537,7 @@ class TFT_Model(TemporalFusionTransformer):
             mase_denoms=self.mase_denoms,
         )
 
-        self.log("val_mase", float(metrics["mase"]), on_epoch=True, prog_bar=False, logger=True)
+        self.log("val_mase", float(metrics["mase"]), on_epoch=True, prog_bar=True, logger=True)
         self.log("val_mase_w1", float(metrics["mase_w1"]), on_epoch=True, prog_bar=False, logger=True)
         self.log("val_mase_w2", float(metrics["mase_w2"]), on_epoch=True, prog_bar=False, logger=True)
         self.log("val_mase_w3", float(metrics["mase_w3"]), on_epoch=True, prog_bar=False, logger=True)
@@ -366,19 +553,18 @@ class TFT_Model(TemporalFusionTransformer):
 
         print("val_mase logged:", self.trainer.callback_metrics.get("val_mase"))
         print("lr:", self.trainer.optimizers[0].param_groups[0]["lr"])
-    
-    # Erstatz für den nromalen LR Scheduler, der per Lightning Logs also nur val_loss die Patience prüft.
-    def configure_optimizers(self):           
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
 
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode="min",
-            factor=LR_Factor,
+            factor=0.5,
             patience=LR_PATIENCE,
             threshold=MIN_DELTA,
-            threshold_mode="abs", # Absolute Veränderung zur vorherigen Epoche von MIN_DELTA
-            min_lr=1e-6, # sehr kleine LR als MIN LR gewählt
+            threshold_mode="abs",
+            min_lr=1e-6,
         )
 
         return {
@@ -391,154 +577,84 @@ class TFT_Model(TemporalFusionTransformer):
             },
         }
 
-def compute_feature_importance(model, raw_predictions, training_ds):
+
+
+def compute_feature_importance(model: PatchTSTModel):
     """
-    Berechnet die interne Feature Importance des TFT.
+    Berechnet eine einfache interne Feature Importance des PatchTST.
 
     Wichtig:
-    - Der Encoder sieht andere Features als der Decoder.
-    - Deshalb werden Encoder- und Decoder-Importances separat aufgebaut
-      und anschließend über den Feature-Namen zusammengeführt.
+    - PatchTST hat keine eingebaute Variable Selection wie der TFT.
+    - Deshalb wird hier die absolute Eingangsgewichtung der Patch-Projektion
+      als Proxy für die Feature-Wichtigkeit verwendet.
     """
 
-    # Interne TFT-Interpretation aus den rohen Modell-Outputs berechnen
-    interpretation = model.interpret_output(raw_predictions.output, reduction="mean")
+    projection_weights = model.patch_projection.weight.detach().float().cpu().numpy()
+    projection_weights = projection_weights.reshape(model.hidden_size, model.patch_len, model.input_dim + model.series_emb_dim)
+    feature_weights = np.abs(projection_weights[:, :, : model.input_dim]).mean(axis=(0, 1))
 
-    encoder_weights = interpretation["encoder_variables"]
-    decoder_weights = interpretation["decoder_variables"]
-
-    if isinstance(encoder_weights, torch.Tensor):
-        encoder_weights = encoder_weights.detach().cpu().numpy()
-    if isinstance(decoder_weights, torch.Tensor):
-        decoder_weights = decoder_weights.detach().cpu().numpy()
-
-    encoder_weights = np.asarray(encoder_weights, dtype=np.float32).reshape(-1)
-    decoder_weights = np.asarray(decoder_weights, dtype=np.float32).reshape(-1)
-
-    # Feature-Namen direkt aus dem TimeSeriesDataSet lesen
-    # Das ist robuster als known_reals + unknown_reals manuell zu kombinieren.
-    encoder_feature_names = list(training_ds.reals)
-
-    # Decoder sieht nur bekannte Features in der Zukunft.
-    # relative_time_idx, encoder_length und target_scales können intern zusätzlich auftauchen.
-    # Deshalb nehmen wir die letzten N Encoder-Features nur dann nicht,
-    # sondern bauen die Decoder-Liste explizit aus den im Dataset definierten known reals.
-    decoder_feature_names = list(training_ds.time_varying_known_reals)
-
-    # Falls interne Zusatzfeatures auch im Decoder auftauchen, Länge angleichen
-    if len(decoder_feature_names) != len(decoder_weights):
-        decoder_feature_names = encoder_feature_names[:len(decoder_weights)]
-
-    # Falls Encoder zusätzliche interne Reals hat, Länge angleichen
-    if len(encoder_feature_names) != len(encoder_weights):
-        encoder_feature_names = encoder_feature_names[:len(encoder_weights)]
-
-    df_encoder = pd.DataFrame({
-        "feature": encoder_feature_names,
-        "encoder_importance": encoder_weights,
-    })
-
-    df_decoder = pd.DataFrame({
-        "feature": decoder_feature_names,
-        "decoder_importance": decoder_weights,
-    })
-
-    df_importance = pd.merge(
-        df_encoder,
-        df_decoder,
-        on="feature",
-        how="outer"
-    ).fillna(0.0)
-
-    df_importance["total_importance"] = (
-        df_importance["encoder_importance"] +
-        df_importance["decoder_importance"]
-    )
-
-    df_importance = df_importance.sort_values(
-        "total_importance",
-        ascending=False
-    ).reset_index(drop=True)
+    df_importance = pd.DataFrame({
+        "feature": model.feature_names,
+        "total_importance": feature_weights,
+    }).sort_values("total_importance", ascending=False).reset_index(drop=True)
 
     return df_importance
 
-def compute_attention_importance(model, raw_predictions):
+
+
+def compute_attention_importance(attention_array: np.ndarray):
     """
-    Berechnet die mittlere TFT-Attention über alle Validierungsbeispiele.
+    Berechnet die mittlere PatchTST-Attention über alle Validierungsbeispiele.
 
     Rückgabe:
-    - DataFrame mit Attention-Gewicht je Decoder-Schritt
+    - DataFrame mit Attention-Gewicht je Query-/Key-Patch
     - zusätzlich das rohe gemittelte Attention-Array
     """
 
-    interpretation = model.interpret_output(raw_predictions.output, reduction="mean")
+    attention = np.asarray(attention_array, dtype=np.float32)
 
-    attention = interpretation.get("attention", None)
-    if attention is None:
-        raise KeyError("Kein 'attention'-Eintrag in der TFT-Interpretation gefunden.")
-
-    if isinstance(attention, torch.Tensor):
-        attention = attention.detach().float().cpu().numpy()
-
-    attention = np.asarray(attention, dtype=np.float32)
-
-    # Erwartung meist: [decoder_horizon, encoder_length]
-    # Falls noch zusätzliche Dimensionen vorhanden sind, robust mitteln
-    while attention.ndim > 2:
+    # Erwartung: [batch, heads, query_patches, key_patches]
+    if attention.ndim == 4:
         attention = attention.mean(axis=0)
-
-     # Fall 1: nur Encoder-Achse vorhanden, z. B. (56,)
-    if attention.ndim == 1:
-        encoder_positions = np.arange(-attention.shape[0] + 1, 1)
-
-        attention_long_df = pd.DataFrame({
-            "decoder_step": 1,
-            "encoder_relative_pos": encoder_positions,
-            "attention_weight": attention,
-        })
-
-        # Für Heatmap 2D machen: eine Zeile
-        attention_matrix = attention[np.newaxis, :]
-
-        return attention_long_df, attention_matrix
+    if attention.ndim == 3:
+        attention = attention.mean(axis=0)
 
     if attention.ndim != 2:
         raise ValueError(f"Unerwartete Attention-Form: {attention.shape}")
 
-    decoder_steps = np.arange(1, attention.shape[0] + 1)
-    encoder_positions = np.arange(-attention.shape[1] + 1, 1)
+    query_patches = np.arange(1, attention.shape[0] + 1)
+    key_patches = np.arange(1, attention.shape[1] + 1)
 
-    attention_df = pd.DataFrame(attention, index=decoder_steps, columns=encoder_positions)
-    attention_df.index.name = "decoder_step"
+    attention_df = pd.DataFrame(attention, index=query_patches, columns=key_patches)
+    attention_df.index.name = "query_patch"
 
     attention_long_df = (
         attention_df.reset_index()
-        .melt(id_vars="decoder_step", var_name="encoder_relative_pos", value_name="attention_weight")
-        .sort_values(["decoder_step", "encoder_relative_pos"])
+        .melt(id_vars="query_patch", var_name="key_patch", value_name="attention_weight")
+        .sort_values(["query_patch", "key_patch"])
         .reset_index(drop=True)
     )
 
     return attention_long_df, attention
 
+
+
 def save_attention_plot(attention_matrix: np.ndarray, out_path: Path) -> None:
     """
-    Speichert die gemittelte TFT-Attention als Säulendiagramm.
-    Zeilen: Decoder-Schritte
-    Spalten: Encoder-Positionen relativ zum Forecast-Start
+    Speichert die gemittelte PatchTST-Attention als Heatmap.
+    Zeilen: Query-Patches
+    Spalten: Key-Patches
     """
-
-    attention = np.asarray(attention_matrix, dtype=float).ravel()
-    encoder_len = attention.shape[0]
-    encoder_positions = np.arange(-encoder_len + 1, 1)
-
-    plt.figure(figsize=(10, 4))
-    plt.bar(encoder_positions, attention, width=0.8)
-    plt.xlabel("Encoder-Position")
-    plt.ylabel("Attention-Gewichtung")
-    plt.title("TFT Attention pro Encoder-Schritt (Durchschnitt über alle Serien)")
+    plt.figure(figsize=(10, 6))
+    plt.imshow(attention_matrix, aspect="auto")
+    plt.colorbar(label="Attention Weight")
+    plt.xlabel("Key patch")
+    plt.ylabel("Query patch")
+    plt.title("PatchTST Attention Heatmap (Validation, mean)")
     plt.tight_layout()
     plt.savefig(out_path, dpi=150)
     plt.close()
+
 
 
 def build_timeseries_datasets(df: pd.DataFrame):
@@ -603,35 +719,23 @@ def build_timeseries_datasets(df: pd.DataFrame):
 
 
 # def save_forecast_example(model, test_loader, out_path: Path) -> None:
-#     raw = model.predict(test_loader, mode="raw", return_x=True)
-#     preds = extract_point_forecast(raw.output.prediction.detach().cpu().numpy())
-#     true_y_log = raw.x["decoder_target"].detach().cpu().numpy()
+#     pass
 
-#     pred_y = np.expm1(preds).clip(min=0.0)
-#     true_y = np.expm1(true_y_log).clip(min=0.0)
-
-#     plt.figure()
-#     plt.plot(true_y[0], label="True")
-#     plt.plot(pred_y[0], label="Pred", linestyle="--")
-#     plt.title("Beispielvorhersage (TFT, Testsplit)")
-#     plt.xlabel("Forecast-Schritt")
-#     plt.ylabel("Sales")
-#     plt.grid(True)
-#     plt.legend()
-#     plt.tight_layout()
-#     plt.savefig(out_path, dpi=150)
-#     plt.close()
 
 
 def suggest_hyperparameters(optuna_trial: optuna.Trial) -> dict:
     return {
-        "learning_rate": optuna_trial.suggest_float("learning_rate", 1e-4, 5e-3, log=True),
-        "hidden_size": optuna_trial.suggest_categorical("hidden_size", [16, 32]),
-        "attention_head_size": optuna_trial.suggest_categorical("attention_head_size", [1, 2, 4]),
-        "hidden_continuous_size": optuna_trial.suggest_categorical("hidden_continuous_size", [8, 16]),
+        "learning_rate": optuna_trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True),
+        "hidden_size": optuna_trial.suggest_categorical("hidden_size", [32, 64]),
+        "attention_head_size": optuna_trial.suggest_categorical("attention_head_size", [2, 4, 8]),
+        "hidden_continuous_size": optuna_trial.suggest_categorical("hidden_continuous_size", [32, 64, 128]),
         "dropout": optuna_trial.suggest_float("dropout", 0.0, 0.3),
-        "batch_size": optuna_trial.suggest_categorical("batch_size", [1024, 2048]),
+        "patch_len": optuna_trial.suggest_categorical("patch_len", [4, 8, 16]),
+        "patch_stride": optuna_trial.suggest_categorical("patch_stride", [2, 4, 8]),
+        "num_transformer_layers": optuna_trial.suggest_categorical("num_transformer_layers", [2, 3, 4]),
+        "batch_size": optuna_trial.suggest_categorical("batch_size", [2048]),
     }
+
 
 
 def reorder_metrics_columns(metrics_dataframe: pd.DataFrame) -> pd.DataFrame:
@@ -658,6 +762,49 @@ def reorder_metrics_columns(metrics_dataframe: pd.DataFrame) -> pd.DataFrame:
     return metrics_dataframe[existing_columns + remaining_columns]
 
 
+
+def collect_predictions(model: PatchTSTModel, dataloader, series_mapping, device):
+    model = model.to(device)
+    model.eval()
+
+    prediction_logs = []
+    true_logs = []
+    series_ids_all = []
+    attention_weights = []
+
+    with torch.no_grad():
+        for batch in dataloader:
+            x, y = batch
+            x = move_batch_to_device(x, device)
+            if isinstance(y, (tuple, list)):
+                y_true_log = y[0].to(device).float()
+            else:
+                y_true_log = y.to(device).float()
+
+            network_out = model(x)
+            prediction = network_out["prediction"].detach().float().cpu().numpy()
+            true_log = y_true_log.detach().float().cpu().numpy()
+
+            prediction_logs.append(extract_point_forecast(prediction))
+            true_logs.append(true_log)
+            series_ids_all.append(extract_series_ids_from_raw_x(x, series_mapping))
+
+            if network_out.get("attention") is not None:
+                attention_weights.append(network_out["attention"].detach().float().cpu().numpy())
+
+    attention = None
+    if attention_weights:
+        attention = np.concatenate(attention_weights, axis=0)
+
+    return {
+        "prediction_log": np.concatenate(prediction_logs, axis=0),
+        "true_log": np.concatenate(true_logs, axis=0),
+        "series_ids": np.concatenate(series_ids_all, axis=0),
+        "attention": attention,
+    }
+
+
+
 def train_one_seed(
     df: pd.DataFrame,
     mase_denoms: dict,
@@ -671,8 +818,9 @@ def train_one_seed(
     hidden_continuous_size = HIDDEN_CONT_SIZE
     dropout_rate = DROPOUT
     batch_size = BATCH_SIZE
-
-    print('learning_rate: ', learning_rate)
+    patch_len = PATCH_LEN
+    patch_stride = PATCH_STRIDE
+    num_transformer_layers = NUM_TRANSFORMER_LAYERS
 
     if hpo_params is not None:
         learning_rate = float(hpo_params.get("learning_rate", learning_rate))
@@ -681,11 +829,14 @@ def train_one_seed(
         hidden_continuous_size = int(hpo_params.get("hidden_continuous_size", hidden_continuous_size))
         dropout_rate = float(hpo_params.get("dropout", dropout_rate))
         batch_size = int(hpo_params.get("batch_size", batch_size))
+        patch_len = int(hpo_params.get("patch_len", patch_len))
+        patch_stride = int(hpo_params.get("patch_stride", patch_stride))
+        num_transformer_layers = int(hpo_params.get("num_transformer_layers", num_transformer_layers))
 
     set_seed(seed_value)
 
     seed_config = {
-        "model": "TFT",
+        "model": "PatchTST",
         "encoder_len": ENCODER_LEN,
         "pred_len": PRED_LEN,
         "batch_size": batch_size,
@@ -694,6 +845,10 @@ def train_one_seed(
         "attn_head_size": attention_head_size,
         "hidden_cont_size": hidden_continuous_size,
         "dropout": dropout_rate,
+        "patch_len": patch_len,
+        "patch_stride": patch_stride,
+        "num_transformer_layers": num_transformer_layers,
+        "series_emb_dim": SERIES_EMB_DIM,
         "max_epochs": MAX_EPOCHS,
         "patience": PATIENCE,
         "lags": LAG_LIST,
@@ -713,6 +868,8 @@ def train_one_seed(
     #training_ds, val_ds, test_ds = build_timeseries_datasets(df)
     training_ds, val_ds = build_timeseries_datasets(df)
     series_mapping = get_series_id_mapping(training_ds)
+    num_series = len(series_mapping) if series_mapping is not None else int(df["series_id"].nunique())
+    feature_names = list(training_ds.reals)
 
     train_loader = training_ds.to_dataloader(
         train=True,
@@ -736,16 +893,26 @@ def train_one_seed(
     #     pin_memory=(TORCH_DEVICE == "cuda"),
     # )
 
-    model = TFT_Model.from_dataset(
-        training_ds,
+    sample_batch = next(iter(train_loader))
+    sample_x, _ = sample_batch
+    input_dim = int(sample_x["encoder_cont"].shape[-1])
+
+    model = PatchTSTModel(
+        input_dim=input_dim,
+        horizon=PRED_LEN,
+        num_series=num_series,
         learning_rate=learning_rate,
         hidden_size=hidden_size,
         attention_head_size=attention_head_size,
         hidden_continuous_size=hidden_continuous_size,
         dropout=dropout_rate,
-        loss=QuantileLoss(quantiles=[0.1, 0.5, 0.9]),
-        log_interval=30,
-        reduce_on_plateau_patience=None, # wird per Funktion def configure_optimizers(self) gesteuert, damit val_mase statt val_loss verwendet werden kann.
+        patch_len=patch_len,
+        patch_stride=patch_stride,
+        num_transformer_layers=num_transformer_layers,
+        series_emb_dim=SERIES_EMB_DIM,
+        mase_denoms=mase_denoms,
+        series_mapping=series_mapping,
+        feature_names=feature_names,
     )
 
     csv_logger = CSVLogger(save_dir=str(run_dir), name="lightning_logs")
@@ -762,13 +929,10 @@ def train_one_seed(
         monitor="val_mase",
         patience=PATIENCE,
         mode="min",
+        min_delta=MIN_DELTA,
     )
 
-    # lr_scheduler_callback = ValMaseLRSchedulerCallback(
-    # patience=LR_PATIENCE,
-    # factor=LR_Factor,
-    # min_lr=1e-6,
-    # )
+    lr_monitor = LearningRateMonitor(logging_interval="epoch")
 
     trainer = pl.Trainer(
         max_epochs=MAX_EPOCHS,
@@ -777,13 +941,12 @@ def train_one_seed(
         precision="bf16-mixed" if TORCH_DEVICE == "cuda" else "32-true",
         gradient_clip_val=0.1,
         logger=csv_logger,
-        callbacks=[ckpt, early],
-        log_every_n_steps=30,
+        callbacks=[ckpt, early, lr_monitor],
+        log_every_n_steps=70,
         enable_progress_bar=True,
         enable_model_summary=False,
         profiler=None,
     )
-
 
     total_start = time.perf_counter()
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
@@ -791,10 +954,23 @@ def train_one_seed(
 
     best_path = ckpt.best_model_path
     if best_path:
-        model = TFT_Model.load_from_checkpoint(
+        model = PatchTSTModel.load_from_checkpoint(
             best_path,
+            input_dim=input_dim,
+            horizon=PRED_LEN,
+            num_series=num_series,
+            learning_rate=learning_rate,
+            hidden_size=hidden_size,
+            attention_head_size=attention_head_size,
+            hidden_continuous_size=hidden_continuous_size,
+            dropout=dropout_rate,
+            patch_len=patch_len,
+            patch_stride=patch_stride,
+            num_transformer_layers=num_transformer_layers,
+            series_emb_dim=SERIES_EMB_DIM,
             mase_denoms=mase_denoms,
             series_mapping=series_mapping,
+            feature_names=feature_names,
         )
 
     metrics_csv = Path(csv_logger.log_dir) / "metrics.csv"
@@ -859,15 +1035,12 @@ def train_one_seed(
 
             epoch_rows.append(row)
 
-    val_raw = model.predict(val_loader, mode="raw", return_x=True)
+    prediction_output = collect_predictions(model, val_loader, series_mapping, model.device)
 
-    # test_raw = model.predict(test_loader, mode="raw", return_x=True)
-    # test_preds = extract_point_forecast(test_raw.output.prediction.detach().cpu().numpy())
-    # test_true_log = test_raw.x["decoder_target"].detach().cpu().numpy()
-    # test_pred_y = np.expm1(test_preds).clip(min=0.0)
-    # test_true_y = np.expm1(test_true_log).clip(min=0.0)
-    # test_series_ids = extract_series_ids_from_raw_x(test_raw.x, series_mapping)
-    # test_metrics = eval_mase_mse_wape_weekly_from_arrays(test_pred_y, test_true_y, test_series_ids, mase_denoms)
+    # test_output = collect_predictions(model, test_loader, series_mapping, model.device)
+    # test_pred_y = np.expm1(test_output["prediction_log"]).clip(min=0.0)
+    # test_true_y = np.expm1(test_output["true_log"]).clip(min=0.0)
+    # test_metrics = eval_mase_mse_wape_weekly_from_arrays(test_pred_y, test_true_y, test_output["series_ids"], mase_denoms)
 
     if not epoch_rows:
         epoch_rows = [{
@@ -896,40 +1069,56 @@ def train_one_seed(
 
     save_plots(run_dir, epoch_rows)
 
+    pred_y = np.expm1(prediction_output["prediction_log"]).clip(min=0.0)
+    true_y = np.expm1(prediction_output["true_log"]).clip(min=0.0)
+    val_metrics = eval_mase_mse_wape_weekly_from_arrays(pred_y, true_y, prediction_output["series_ids"], mase_denoms)
+    external_val_loss = eval_loss_logspace_from_arrays(prediction_output["prediction_log"], prediction_output["true_log"])
+
+    if epoch_rows:
+        epoch_rows[-1]["val_loss"] = float(external_val_loss)
+        epoch_rows[-1]["val_mase"] = float(val_metrics["mase"])
+        epoch_rows[-1]["val_mase_w1"] = float(val_metrics["mase_w1"])
+        epoch_rows[-1]["val_mase_w2"] = float(val_metrics["mase_w2"])
+        epoch_rows[-1]["val_mase_w3"] = float(val_metrics["mase_w3"])
+        epoch_rows[-1]["val_mase_w4"] = float(val_metrics["mase_w4"])
+        epoch_rows[-1]["val_wape"] = float(val_metrics["wape"])
+        epoch_rows[-1]["val_wape_w1"] = float(val_metrics["wape_w1"])
+        epoch_rows[-1]["val_wape_w2"] = float(val_metrics["wape_w2"])
+        epoch_rows[-1]["val_wape_w3"] = float(val_metrics["wape_w3"])
+        epoch_rows[-1]["val_wape_w4"] = float(val_metrics["wape_w4"])
+        epoch_rows[-1]["val_mse"] = float(val_metrics["mse"])
+
+    metrics_dataframe = reorder_metrics_columns(pd.DataFrame(epoch_rows))
+    metrics_dataframe.to_csv(run_dir / "metrics.csv", index=False)
+
     # Feature Importance berechnen
-    feature_importance_df = compute_feature_importance(
-        model=model,
-        raw_predictions=val_raw,
-        training_ds=training_ds
-    )
+    feature_importance_df = compute_feature_importance(model=model)
 
     # CSV speichern
     feature_importance_df.to_csv(
-        run_dir / "tft_feature_importance.csv",
+        run_dir / "patchtst_feature_importance.csv",
         index=False
     )
 
     # Attention Interpretierbarkeit berechnen
-    attention_long_df, attention_matrix = compute_attention_importance(
-        model=model,
-        raw_predictions=val_raw,
-    )
+    if prediction_output["attention"] is not None:
+        attention_long_df, attention_matrix = compute_attention_importance(
+            attention_array=prediction_output["attention"],
+        )
 
-    attention_long_df.to_csv(
-        run_dir / "tft_attention.csv",
-        index=False
-    )
+        attention_long_df.to_csv(
+            run_dir / "patchtst_attention.csv",
+            index=False
+        )
 
-    save_attention_plot(
-        attention_matrix=attention_matrix,
-        out_path=run_dir / "tft_attention.png"
-    )
+        save_attention_plot(
+            attention_matrix=attention_matrix,
+            out_path=run_dir / "patchtst_attention.png"
+        )
 
     # -------------------------------------------------------
     # Plot erstellen
     # -------------------------------------------------------
-
-    import matplotlib.pyplot as plt
 
     plt.figure(figsize=(8, 6))
 
@@ -940,14 +1129,14 @@ def train_one_seed(
         legend=False
     )
 
-    plt.xlabel("Feature Relevanz")
+    plt.xlabel("Feature Importance")
     plt.ylabel("Feature")
-    plt.title("TFT Feature Relevanz")
+    plt.title("PatchTST Feature Importance")
 
     plt.tight_layout()
 
     plt.savefig(
-        run_dir / "tft_feature_importance.png",
+        run_dir / "patchtst_feature_importance.png",
         dpi=150
     )
 
@@ -993,10 +1182,12 @@ def train_one_seed(
     return summary
 
 
+
 def build_trial_seed_list(trial_base_seed: int, trial_seed_count: int) -> list[int]:
     if trial_seed_count <= 1:
         return [trial_base_seed]
     return [trial_base_seed + i for i in range(trial_seed_count)]
+
 
 
 def objective_factory(df: pd.DataFrame, mase_denoms: dict, optuna_base_dir: Path):
@@ -1028,6 +1219,7 @@ def objective_factory(df: pd.DataFrame, mase_denoms: dict, optuna_base_dir: Path
     return objective
 
 
+
 def main():
     df = load_preprocessed()
     df = add_time_series_features(df)
@@ -1047,7 +1239,7 @@ def main():
     mase_denoms = compute_mase_denominators(train_df, seasonality=7)
 
     config = {
-        "model": "TFT",
+        "model": "PatchTST",
         "encoder_len": ENCODER_LEN,
         "pred_len": PRED_LEN,
         "batch_size": BATCH_SIZE,
@@ -1056,6 +1248,10 @@ def main():
         "attn_head_size": ATTN_HEAD_SIZE,
         "hidden_cont_size": HIDDEN_CONT_SIZE,
         "dropout": DROPOUT,
+        "patch_len": PATCH_LEN,
+        "patch_stride": PATCH_STRIDE,
+        "num_transformer_layers": NUM_TRANSFORMER_LAYERS,
+        "series_emb_dim": SERIES_EMB_DIM,
         "max_epochs": MAX_EPOCHS,
         "patience": PATIENCE,
         "lags": LAG_LIST,
@@ -1063,6 +1259,7 @@ def main():
         "known_real_features": known_reals,
         "unknown_real_features": unknown_reals,
         "static_categoricals": STATIC_CATEGORICALS,
+        "all_features": all_features,
         "max_series": MAX_SERIES,
         "device": DEVICE,
         "base_seed": BASE_SEED,
@@ -1072,7 +1269,7 @@ def main():
     }
 
     ts = time.strftime("%Y%m%d-%H%M%S")
-    parent_run_dir = RUNS_DIR / f"{ts}_TFT_seed={BASE_SEED}__num_seeds={NUM_SEEDS}"
+    parent_run_dir = RUNS_DIR / f"{ts}_PatchTST_seed={BASE_SEED}__num_seeds={NUM_SEEDS}"
     parent_run_dir.mkdir(parents=True, exist_ok=True)
     save_json(parent_run_dir / "config.json", config)
     save_json(parent_run_dir / "system_info.json", get_system_info())
