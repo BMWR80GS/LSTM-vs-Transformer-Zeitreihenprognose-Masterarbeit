@@ -51,26 +51,26 @@ MAX_SERIES = 200
 ENCODER_LEN = 56
 PRED_LEN = 28
 HORIZON = PRED_LEN
-MAX_EPOCHS = 12
+MAX_EPOCHS = 2
 
 
 # -----------------------------------------------------------------------------
 # Modell-Hyperparameter
 # -----------------------------------------------------------------------------
-BATCH_SIZE = 2048
+BATCH_SIZE = 4096
 LR = 5e-3
-HIDDEN_SIZE = 16
+HIDDEN_SIZE = 32
 ATTN_HEAD_SIZE = 4
-HIDDEN_CONT_SIZE = 32
+HIDDEN_CONT_SIZE = 16
 DROPOUT = 0.1
 
-PATCH_LEN = 8
-PATCH_STRIDE = 4
-NUM_TRANSFORMER_LAYERS = 2
-SERIES_EMB_DIM = 16
+PATCH_LEN = 16
+PATCH_STRIDE = 2
+NUM_TRANSFORMER_LAYERS = 3
+SERIES_EMB_DIM = 16 # Anzahl der Embeding Features
 
-LR_PATIENCE = 2
-PATIENCE = 4
+LR_PATIENCE = 1
+PATIENCE = 3
 MIN_DELTA = 0.001
 
 
@@ -579,84 +579,6 @@ class PatchTSTModel(pl.LightningModule):
 
 
 
-def compute_feature_importance(model: PatchTSTModel):
-    """
-    Berechnet eine einfache interne Feature Importance des PatchTST.
-
-    Wichtig:
-    - PatchTST hat keine eingebaute Variable Selection wie der TFT.
-    - Deshalb wird hier die absolute Eingangsgewichtung der Patch-Projektion
-      als Proxy für die Feature-Wichtigkeit verwendet.
-    """
-
-    projection_weights = model.patch_projection.weight.detach().float().cpu().numpy()
-    projection_weights = projection_weights.reshape(model.hidden_size, model.patch_len, model.input_dim + model.series_emb_dim)
-    feature_weights = np.abs(projection_weights[:, :, : model.input_dim]).mean(axis=(0, 1))
-
-    df_importance = pd.DataFrame({
-        "feature": model.feature_names,
-        "total_importance": feature_weights,
-    }).sort_values("total_importance", ascending=False).reset_index(drop=True)
-
-    return df_importance
-
-
-
-def compute_attention_importance(attention_array: np.ndarray):
-    """
-    Berechnet die mittlere PatchTST-Attention über alle Validierungsbeispiele.
-
-    Rückgabe:
-    - DataFrame mit Attention-Gewicht je Query-/Key-Patch
-    - zusätzlich das rohe gemittelte Attention-Array
-    """
-
-    attention = np.asarray(attention_array, dtype=np.float32)
-
-    # Erwartung: [batch, heads, query_patches, key_patches]
-    if attention.ndim == 4:
-        attention = attention.mean(axis=0)
-    if attention.ndim == 3:
-        attention = attention.mean(axis=0)
-
-    if attention.ndim != 2:
-        raise ValueError(f"Unerwartete Attention-Form: {attention.shape}")
-
-    query_patches = np.arange(1, attention.shape[0] + 1)
-    key_patches = np.arange(1, attention.shape[1] + 1)
-
-    attention_df = pd.DataFrame(attention, index=query_patches, columns=key_patches)
-    attention_df.index.name = "query_patch"
-
-    attention_long_df = (
-        attention_df.reset_index()
-        .melt(id_vars="query_patch", var_name="key_patch", value_name="attention_weight")
-        .sort_values(["query_patch", "key_patch"])
-        .reset_index(drop=True)
-    )
-
-    return attention_long_df, attention
-
-
-
-def save_attention_plot(attention_matrix: np.ndarray, out_path: Path) -> None:
-    """
-    Speichert die gemittelte PatchTST-Attention als Heatmap.
-    Zeilen: Query-Patches
-    Spalten: Key-Patches
-    """
-    plt.figure(figsize=(10, 6))
-    plt.imshow(attention_matrix, aspect="auto")
-    plt.colorbar(label="Attention Weight")
-    plt.xlabel("Key patch")
-    plt.ylabel("Query patch")
-    plt.title("PatchTST Attention Heatmap (Validation, mean)")
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=150)
-    plt.close()
-
-
-
 def build_timeseries_datasets(df: pd.DataFrame):
     df = df.copy()
     df["series_id"] = df["series_id"].astype(str)
@@ -725,15 +647,15 @@ def build_timeseries_datasets(df: pd.DataFrame):
 
 def suggest_hyperparameters(optuna_trial: optuna.Trial) -> dict:
     return {
-        "learning_rate": optuna_trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True),
+        "learning_rate": optuna_trial.suggest_float("learning_rate", 1e-4, 5e-3, log=True),
         "hidden_size": optuna_trial.suggest_categorical("hidden_size", [32, 64]),
-        "attention_head_size": optuna_trial.suggest_categorical("attention_head_size", [2, 4, 8]),
+        "attention_head_size": optuna_trial.suggest_categorical("attention_head_size", [1, 2, 4]),
         "hidden_continuous_size": optuna_trial.suggest_categorical("hidden_continuous_size", [32, 64, 128]),
         "dropout": optuna_trial.suggest_float("dropout", 0.0, 0.3),
-        "patch_len": optuna_trial.suggest_categorical("patch_len", [4, 8, 16]),
-        "patch_stride": optuna_trial.suggest_categorical("patch_stride", [2, 4, 8]),
-        "num_transformer_layers": optuna_trial.suggest_categorical("num_transformer_layers", [2, 3, 4]),
-        "batch_size": optuna_trial.suggest_categorical("batch_size", [2048]),
+        "patch_len": optuna_trial.suggest_categorical("patch_len", [4, 8, 16]), # größer = generischer, kleiner = genauer (rechenintensiver)
+        "patch_stride": optuna_trial.suggest_categorical("patch_stride", [2, 4, 8]), # wie weit das Fenster beim Erzeugen des nächsten Patches weiterspringt. In Kombination mit patch_len entstehen unterscheidlich enge Patch-Raster.
+        "num_transformer_layers": optuna_trial.suggest_categorical("num_transformer_layers", [2, 3, 4]), # wie viele Transformer-Blöcke gestapelt werden. 
+        "batch_size": optuna_trial.suggest_categorical("batch_size", [1024, 2048]),
     }
 
 
@@ -770,7 +692,6 @@ def collect_predictions(model: PatchTSTModel, dataloader, series_mapping, device
     prediction_logs = []
     true_logs = []
     series_ids_all = []
-    attention_weights = []
 
     with torch.no_grad():
         for batch in dataloader:
@@ -789,18 +710,10 @@ def collect_predictions(model: PatchTSTModel, dataloader, series_mapping, device
             true_logs.append(true_log)
             series_ids_all.append(extract_series_ids_from_raw_x(x, series_mapping))
 
-            if network_out.get("attention") is not None:
-                attention_weights.append(network_out["attention"].detach().float().cpu().numpy())
-
-    attention = None
-    if attention_weights:
-        attention = np.concatenate(attention_weights, axis=0)
-
     return {
         "prediction_log": np.concatenate(prediction_logs, axis=0),
         "true_log": np.concatenate(true_logs, axis=0),
         "series_ids": np.concatenate(series_ids_all, axis=0),
-        "attention": attention,
     }
 
 
@@ -1091,76 +1004,30 @@ def train_one_seed(
     metrics_dataframe = reorder_metrics_columns(pd.DataFrame(epoch_rows))
     metrics_dataframe.to_csv(run_dir / "metrics.csv", index=False)
 
-    # Feature Importance berechnen
-    feature_importance_df = compute_feature_importance(model=model)
-
-    # CSV speichern
-    feature_importance_df.to_csv(
-        run_dir / "patchtst_feature_importance.csv",
-        index=False
-    )
-
-    # Attention Interpretierbarkeit berechnen
-    if prediction_output["attention"] is not None:
-        attention_long_df, attention_matrix = compute_attention_importance(
-            attention_array=prediction_output["attention"],
-        )
-
-        attention_long_df.to_csv(
-            run_dir / "patchtst_attention.csv",
-            index=False
-        )
-
-        save_attention_plot(
-            attention_matrix=attention_matrix,
-            out_path=run_dir / "patchtst_attention.png"
-        )
-
-    # -------------------------------------------------------
-    # Plot erstellen
-    # -------------------------------------------------------
-
-    plt.figure(figsize=(8, 6))
-
-    feature_importance_df.sort_values("total_importance").plot(
-        x="feature",
-        y="total_importance",
-        kind="barh",
-        legend=False
-    )
-
-    plt.xlabel("Feature Importance")
-    plt.ylabel("Feature")
-    plt.title("PatchTST Feature Importance")
-
-    plt.tight_layout()
-
-    plt.savefig(
-        run_dir / "patchtst_feature_importance.png",
-        dpi=150
-    )
-
-    plt.close()
-
-    last_epoch_row = epoch_rows[-1] if epoch_rows else {}
+    if "val_mase" in metrics_dataframe.columns and metrics_dataframe["val_mase"].notna().any():
+        best_epoch_idx = metrics_dataframe["val_mase"].astype(float).idxmin()
+        best_epoch_row = metrics_dataframe.loc[best_epoch_idx].to_dict()
+    else:
+        best_epoch_row = metrics_dataframe.iloc[-1].to_dict()
 
     summary = {
         "seed": int(seed_value),
         "best_model_path": best_path,
-        "best_val_loss": float(ckpt.best_model_score) if ckpt.best_model_score is not None else None,
+        "best_epoch": int(best_epoch_row["epoch"]) if pd.notna(best_epoch_row.get("epoch", np.nan)) else None,
+        "best_val_mase": float(ckpt.best_model_score) if ckpt.best_model_score is not None else None,
         "total_time_sec": float(total_time),
         "epochs_ran": int(len(epoch_rows)),
-        "val_mase": float(last_epoch_row["val_mase"]) if pd.notna(last_epoch_row.get("val_mase", np.nan)) else None,
-        "val_mase_w1": float(last_epoch_row["val_mase_w1"]) if pd.notna(last_epoch_row.get("val_mase_w1", np.nan)) else None,
-        "val_mase_w2": float(last_epoch_row["val_mase_w2"]) if pd.notna(last_epoch_row.get("val_mase_w2", np.nan)) else None,
-        "val_mase_w3": float(last_epoch_row["val_mase_w3"]) if pd.notna(last_epoch_row.get("val_mase_w3", np.nan)) else None,
-        "val_mase_w4": float(last_epoch_row["val_mase_w4"]) if pd.notna(last_epoch_row.get("val_mase_w4", np.nan)) else None,
-        "val_wape": float(last_epoch_row["val_wape"]) if pd.notna(last_epoch_row.get("val_wape", np.nan)) else None,
-        "val_wape_w1": float(last_epoch_row["val_wape_w1"]) if pd.notna(last_epoch_row.get("val_wape_w1", np.nan)) else None,
-        "val_wape_w2": float(last_epoch_row["val_wape_w2"]) if pd.notna(last_epoch_row.get("val_wape_w2", np.nan)) else None,
-        "val_wape_w3": float(last_epoch_row["val_wape_w3"]) if pd.notna(last_epoch_row.get("val_wape_w3", np.nan)) else None,
-        "val_wape_w4": float(last_epoch_row["val_wape_w4"]) if pd.notna(last_epoch_row.get("val_wape_w4", np.nan)) else None,
-        "val_mse": float(last_epoch_row["val_mse"]) if pd.notna(last_epoch_row.get("val_mse", np.nan)) else None,
+        "val_mase": float(best_epoch_row["val_mase"]) if pd.notna(best_epoch_row.get("val_mase", np.nan)) else None,
+        "val_mase_w1": float(best_epoch_row["val_mase_w1"]) if pd.notna(best_epoch_row.get("val_mase_w1", np.nan)) else None,
+        "val_mase_w2": float(best_epoch_row["val_mase_w2"]) if pd.notna(best_epoch_row.get("val_mase_w2", np.nan)) else None,
+        "val_mase_w3": float(best_epoch_row["val_mase_w3"]) if pd.notna(best_epoch_row.get("val_mase_w3", np.nan)) else None,
+        "val_mase_w4": float(best_epoch_row["val_mase_w4"]) if pd.notna(best_epoch_row.get("val_mase_w4", np.nan)) else None,
+        "val_wape": float(best_epoch_row["val_wape"]) if pd.notna(best_epoch_row.get("val_wape", np.nan)) else None,
+        "val_wape_w1": float(best_epoch_row["val_wape_w1"]) if pd.notna(best_epoch_row.get("val_wape_w1", np.nan)) else None,
+        "val_wape_w2": float(best_epoch_row["val_wape_w2"]) if pd.notna(best_epoch_row.get("val_wape_w2", np.nan)) else None,
+        "val_wape_w3": float(best_epoch_row["val_wape_w3"]) if pd.notna(best_epoch_row.get("val_wape_w3", np.nan)) else None,
+        "val_wape_w4": float(best_epoch_row["val_wape_w4"]) if pd.notna(best_epoch_row.get("val_wape_w4", np.nan)) else None,
+        "val_mse": float(best_epoch_row["val_mse"]) if pd.notna(best_epoch_row.get("val_mse", np.nan)) else None,
         # "test_mase": float(test_metrics["mase"]),
         # "test_mase_w1": float(test_metrics["mase_w1"]),
         # "test_mase_w2": float(test_metrics["mase_w2"]),
@@ -1209,7 +1076,7 @@ def objective_factory(df: pd.DataFrame, mase_denoms: dict, optuna_base_dir: Path
                 seed_value=seed_value,
                 hpo_params=suggested_hyperparameters,
             )
-            validation_mase_values.append(float(seed_summary["val_mase"]))
+            validation_mase_values.append(float(seed_summary["best_val_mase"]))
 
         mean_validation_mase = float(np.mean(validation_mase_values)) if validation_mase_values else float("inf")
         optuna_trial.set_user_attr("trial_seeds", trial_seed_list)
@@ -1318,8 +1185,8 @@ def main():
         )
         all_seed_summaries.append(seed_summary)
 
-        if np.isfinite(seed_summary["val_mase"]) and seed_summary["val_mase"] < best_overall_val_mase:
-            best_overall_val_mase = float(seed_summary["val_mase"])
+        if np.isfinite(seed_summary["best_val_mase"]) and seed_summary["best_val_mase"] < best_overall_val_mase:
+            best_overall_val_mase = float(seed_summary["best_val_mase"])
             best_overall_seed = int(current_seed)
             best_overall_model_path = seed_summary["best_model_path"]
 

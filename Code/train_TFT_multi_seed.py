@@ -55,9 +55,9 @@ MAX_EPOCHS = 15
 # -----------------------------------------------------------------------------
 # Modell-Hyperparameter
 # -----------------------------------------------------------------------------
-BATCH_SIZE = 2048
+BATCH_SIZE = 1024
 LR = 5e-3
-HIDDEN_SIZE = 16
+HIDDEN_SIZE = 32
 ATTN_HEAD_SIZE = 4
 HIDDEN_CONT_SIZE = 16
 DROPOUT = 0.1
@@ -70,8 +70,8 @@ MIN_DELTA = 0.001
 # -----------------------------------------------------------------------------
 # Optuna
 # -----------------------------------------------------------------------------
-USE_OPTUNA = False
-OPTUNA_TRIALS = 5
+USE_OPTUNA = True
+OPTUNA_TRIALS = 3
 OPTUNA_TIMEOUT_SEC = None
 OPTUNA_SEEDS_PER_TRIAL = 1
 OPTUNA_DIRECTION = "minimize"
@@ -953,25 +953,64 @@ def train_one_seed(
 
     plt.close()
 
-    last_epoch_row = epoch_rows[-1] if epoch_rows else {}
+    # last_epoch_row = epoch_rows[-1] if epoch_rows else {}
+
+    # summary = {
+    #     "seed": int(seed_value),
+    #     "best_model_path": best_path,
+    #     "best_val_loss": float(ckpt.best_model_score) if ckpt.best_model_score is not None else None,
+    #     "total_time_sec": float(total_time),
+    #     "epochs_ran": int(len(epoch_rows)),
+    #     "val_mase": float(last_epoch_row["val_mase"]) if pd.notna(last_epoch_row.get("val_mase", np.nan)) else None,
+    #     "val_mase_w1": float(last_epoch_row["val_mase_w1"]) if pd.notna(last_epoch_row.get("val_mase_w1", np.nan)) else None,
+    #     "val_mase_w2": float(last_epoch_row["val_mase_w2"]) if pd.notna(last_epoch_row.get("val_mase_w2", np.nan)) else None,
+    #     "val_mase_w3": float(last_epoch_row["val_mase_w3"]) if pd.notna(last_epoch_row.get("val_mase_w3", np.nan)) else None,
+    #     "val_mase_w4": float(last_epoch_row["val_mase_w4"]) if pd.notna(last_epoch_row.get("val_mase_w4", np.nan)) else None,
+    #     "val_wape": float(last_epoch_row["val_wape"]) if pd.notna(last_epoch_row.get("val_wape", np.nan)) else None,
+    #     "val_wape_w1": float(last_epoch_row["val_wape_w1"]) if pd.notna(last_epoch_row.get("val_wape_w1", np.nan)) else None,
+    #     "val_wape_w2": float(last_epoch_row["val_wape_w2"]) if pd.notna(last_epoch_row.get("val_wape_w2", np.nan)) else None,
+    #     "val_wape_w3": float(last_epoch_row["val_wape_w3"]) if pd.notna(last_epoch_row.get("val_wape_w3", np.nan)) else None,
+    #     "val_wape_w4": float(last_epoch_row["val_wape_w4"]) if pd.notna(last_epoch_row.get("val_wape_w4", np.nan)) else None,
+    #     "val_mse": float(last_epoch_row["val_mse"]) if pd.notna(last_epoch_row.get("val_mse", np.nan)) else None,
+    #     # "test_mase": float(test_metrics["mase"]),
+    #     # "test_mase_w1": float(test_metrics["mase_w1"]),
+    #     # "test_mase_w2": float(test_metrics["mase_w2"]),
+    #     # "test_mase_w3": float(test_metrics["mase_w3"]),
+    #     # "test_mase_w4": float(test_metrics["mase_w4"]),
+    #     # "test_wape": float(test_metrics["wape"]),
+    #     # "test_wape_w1": float(test_metrics["wape_w1"]),
+    #     # "test_wape_w2": float(test_metrics["wape_w2"]),
+    #     # "test_wape_w3": float(test_metrics["wape_w3"]),
+    #     # "test_wape_w4": float(test_metrics["wape_w4"]),
+    #     # "test_mse": float(test_metrics["mse"]),
+    # }
+
+    metrics_dataframe = reorder_metrics_columns(pd.DataFrame(epoch_rows))
+
+    if "val_mase" in metrics_dataframe.columns and metrics_dataframe["val_mase"].notna().any():
+        best_epoch_idx = metrics_dataframe["val_mase"].astype(float).idxmin()
+        best_epoch_row = metrics_dataframe.loc[best_epoch_idx].to_dict()
+    else:
+        best_epoch_row = metrics_dataframe.iloc[-1].to_dict()
 
     summary = {
         "seed": int(seed_value),
         "best_model_path": best_path,
-        "best_val_loss": float(ckpt.best_model_score) if ckpt.best_model_score is not None else None,
+        "best_epoch": int(best_epoch_row["epoch"]) if pd.notna(best_epoch_row.get("epoch", np.nan)) else None,
+        "best_val_mase": float(ckpt.best_model_score) if ckpt.best_model_score is not None else None,
         "total_time_sec": float(total_time),
         "epochs_ran": int(len(epoch_rows)),
-        "val_mase": float(last_epoch_row["val_mase"]) if pd.notna(last_epoch_row.get("val_mase", np.nan)) else None,
-        "val_mase_w1": float(last_epoch_row["val_mase_w1"]) if pd.notna(last_epoch_row.get("val_mase_w1", np.nan)) else None,
-        "val_mase_w2": float(last_epoch_row["val_mase_w2"]) if pd.notna(last_epoch_row.get("val_mase_w2", np.nan)) else None,
-        "val_mase_w3": float(last_epoch_row["val_mase_w3"]) if pd.notna(last_epoch_row.get("val_mase_w3", np.nan)) else None,
-        "val_mase_w4": float(last_epoch_row["val_mase_w4"]) if pd.notna(last_epoch_row.get("val_mase_w4", np.nan)) else None,
-        "val_wape": float(last_epoch_row["val_wape"]) if pd.notna(last_epoch_row.get("val_wape", np.nan)) else None,
-        "val_wape_w1": float(last_epoch_row["val_wape_w1"]) if pd.notna(last_epoch_row.get("val_wape_w1", np.nan)) else None,
-        "val_wape_w2": float(last_epoch_row["val_wape_w2"]) if pd.notna(last_epoch_row.get("val_wape_w2", np.nan)) else None,
-        "val_wape_w3": float(last_epoch_row["val_wape_w3"]) if pd.notna(last_epoch_row.get("val_wape_w3", np.nan)) else None,
-        "val_wape_w4": float(last_epoch_row["val_wape_w4"]) if pd.notna(last_epoch_row.get("val_wape_w4", np.nan)) else None,
-        "val_mse": float(last_epoch_row["val_mse"]) if pd.notna(last_epoch_row.get("val_mse", np.nan)) else None,
+        "val_mase": float(best_epoch_row["val_mase"]) if pd.notna(best_epoch_row.get("val_mase", np.nan)) else None,
+        "val_mase_w1": float(best_epoch_row["val_mase_w1"]) if pd.notna(best_epoch_row.get("val_mase_w1", np.nan)) else None,
+        "val_mase_w2": float(best_epoch_row["val_mase_w2"]) if pd.notna(best_epoch_row.get("val_mase_w2", np.nan)) else None,
+        "val_mase_w3": float(best_epoch_row["val_mase_w3"]) if pd.notna(best_epoch_row.get("val_mase_w3", np.nan)) else None,
+        "val_mase_w4": float(best_epoch_row["val_mase_w4"]) if pd.notna(best_epoch_row.get("val_mase_w4", np.nan)) else None,
+        "val_wape": float(best_epoch_row["val_wape"]) if pd.notna(best_epoch_row.get("val_wape", np.nan)) else None,
+        "val_wape_w1": float(best_epoch_row["val_wape_w1"]) if pd.notna(best_epoch_row.get("val_wape_w1", np.nan)) else None,
+        "val_wape_w2": float(best_epoch_row["val_wape_w2"]) if pd.notna(best_epoch_row.get("val_wape_w2", np.nan)) else None,
+        "val_wape_w3": float(best_epoch_row["val_wape_w3"]) if pd.notna(best_epoch_row.get("val_wape_w3", np.nan)) else None,
+        "val_wape_w4": float(best_epoch_row["val_wape_w4"]) if pd.notna(best_epoch_row.get("val_wape_w4", np.nan)) else None,
+        "val_mse": float(best_epoch_row["val_mse"]) if pd.notna(best_epoch_row.get("val_mse", np.nan)) else None,
         # "test_mase": float(test_metrics["mase"]),
         # "test_mase_w1": float(test_metrics["mase_w1"]),
         # "test_mase_w2": float(test_metrics["mase_w2"]),
@@ -1018,7 +1057,7 @@ def objective_factory(df: pd.DataFrame, mase_denoms: dict, optuna_base_dir: Path
                 seed_value=seed_value,
                 hpo_params=suggested_hyperparameters,
             )
-            validation_mase_values.append(float(seed_summary["val_mase"]))
+            validation_mase_values.append(float(seed_summary["best_val_mase"]))
 
         mean_validation_mase = float(np.mean(validation_mase_values)) if validation_mase_values else float("inf")
         optuna_trial.set_user_attr("trial_seeds", trial_seed_list)
@@ -1121,8 +1160,8 @@ def main():
         )
         all_seed_summaries.append(seed_summary)
 
-        if np.isfinite(seed_summary["val_mase"]) and seed_summary["val_mase"] < best_overall_val_mase:
-            best_overall_val_mase = float(seed_summary["val_mase"])
+        if np.isfinite(seed_summary["best_val_mase"]) and seed_summary["best_val_mase"] < best_overall_val_mase:
+            best_overall_val_mase = float(seed_summary["best_val_mase"])
             best_overall_seed = int(current_seed)
             best_overall_model_path = seed_summary["best_model_path"]
 
