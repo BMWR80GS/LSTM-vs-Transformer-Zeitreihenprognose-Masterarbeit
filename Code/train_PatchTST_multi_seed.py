@@ -850,8 +850,8 @@ def train_one_seed(
         callbacks=[ckpt, early, lr_monitor],
         log_every_n_steps=70,
         enable_progress_bar=True,
-        enable_model_summary=True,
-        profiler="simple",
+        enable_model_summary=False,
+        profiler=None,
     )
 
     total_start = time.perf_counter()
