@@ -48,7 +48,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Seeds: Anzahl an Traningsläufen mit der identischen Hyperparameterkonfiguration | SEED = Random Initialisierung | NUM_SEEDS = Anzahl an SEEDS (Trainingsläufen)
 SEED = 1
-NUM_SEEDS = 2 # Wichtig: Wenn Optuna eingeschaltet ist und damit bereits Optuna mehrere Seeds durchläuft, sind diese Seeds hier nicht nötig. 
+NUM_SEEDS = 1 # Wichtig: Wenn Optuna eingeschaltet ist und damit bereits Optuna mehrere Seeds durchläuft, sind diese Seeds hier nicht nötig. 
 #Für die finalen Runs mit den Hyperparametern wird Optuna ausgeschaltet und dann kann hier NUM_SEEDS wieder zb. auf 3 gestellt werden.
 
 # Wird nur zur Dokumentation genutzt. Anzahl der Serien wird durch Subset bestimmt.
@@ -73,10 +73,10 @@ BATCH_SIZE = 1024
 
 
 # Hidden Size: Anzahl der Einheiten (Neuronen) pro verstecktem Layer 
-HIDDEN_SIZE = 128
+HIDDEN_SIZE = 256
 
 # LAYER = Anzahl der LSTM-Layer.
-LAYER = 2
+LAYER = 3
 
 # DROPOUT = Dropout zwischen den LSTM-Layern (wirkt nur bei LAYER > 1).
 DROPOUT = 0.1
@@ -109,8 +109,8 @@ STATE_EMB_DIM = 2
 # Optuna ist ein Tool, welches zur gezielten Suche der optimalen Hyperparameterkonfiguration genutzt werden kann. 
 # Der Suchraum der Parameter wird in der Funktion 'suggest_hyperparameters' bestimmt.
 USE_OPTUNA = True  # Für die Suche der besten Hyperparameter True, für finale Runs mit festgelegten Parametern False
-OPTUNA_TRIALS = None # wird nicht mit fester Anzahl Trials verglichen, sondern jedes Modell bekommt eine definierte Trainingszeit. Hier 15 Stunden pro Modell
-OPTUNA_TIMEOUT_SEC = 54000
+OPTUNA_TRIALS = None # wird nicht mit fester Anzahl Trials verglichen, sondern jedes Modell bekommt eine definierte Trainingszeit. Hier 12 Stunden pro Modell
+OPTUNA_TIMEOUT_SEC = 43200 # 12 Stunden
 OPTUNA_SEEDS_PER_TRIAL = 1 # Jede Parameterkombination wird mit defefinierter Anzahl zufällig im Lösungsraum gestartet, Analog zu NUM_SEEDS
 OPTUNA_DIRECTION = "minimize"  # Lossvalue von val_mase minimieren
 
@@ -522,10 +522,9 @@ def suggest_hyperparameters(optuna_trial: optuna.Trial) -> dict:
     # Die Parameter Grenzen für Optuna festlegen, in denen nach der optimalen Kombination gesucht wird
     suggested_hyperparameters = {
         "learning_rate": optuna_trial.suggest_float("learning_rate", 1e-4, 5e-3, log=True),
-        "hidden_size": optuna_trial.suggest_categorical("hidden_size", [64, 128]),
+        "hidden_size": optuna_trial.suggest_categorical("hidden_size", [128, 256]),
         "num_layers": optuna_trial.suggest_categorical("num_layers", [2, 3]),
         "dropout": optuna_trial.suggest_float("dropout", 0.0, 0.3),
-        #"batch_size": optuna_trial.suggest_categorical("batch_size", [1024, 2048]),
     }
     return suggested_hyperparameters
 
@@ -614,6 +613,23 @@ def reorder_metrics_columns(metrics_dataframe: pd.DataFrame) -> pd.DataFrame:
     remaining_columns = [c for c in metrics_dataframe.columns if c not in existing_columns]
     return metrics_dataframe[existing_columns + remaining_columns]
 
+
+def count_parameters(model: nn.Module) -> dict:
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    # Aufschlüsselung nach Layer-Gruppen
+    breakdown = {}
+    for name, module in model.named_children():
+        params = sum(p.numel() for p in module.parameters())
+        breakdown[name] = params
+    
+    return {
+        "total": total,
+        "trainable": trainable,
+        "non_trainable": total - trainable,
+        "breakdown": breakdown,
+    }
 
 def train_one_seed(
     df: pd.DataFrame,
@@ -708,6 +724,12 @@ def train_one_seed(
         min_lr=LR_MIN,
     )
 
+    # Parameter zählen und loggen
+    param_info = count_parameters(model)
+    print(f"Trainierbare Parameter: {param_info['trainable']:,}")
+    print(f"Gesamt Parameter:       {param_info['total']:,}")
+    print(f"Aufschlüsselung:        {param_info['breakdown']}")
+    
     # Protokollierung pro Epoche.
     epoch_rows = []
 
