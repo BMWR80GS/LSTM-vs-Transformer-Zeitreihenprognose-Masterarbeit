@@ -72,10 +72,10 @@ MAX_EPOCHS = 25
 BATCH_SIZE = 1024
 
 # Hidden Size: Anzahl der Einheiten (Neuronen) pro verstecktem Layer 
-HIDDEN_SIZE = 128
+HIDDEN_SIZE = 256
 
 # LAYER = Anzahl der LSTM-Layer.
-LAYER = 2
+LAYER = 3
 
 # DROPOUT = Dropout zwischen den LSTM-Layern (wirkt nur bei LAYER > 1).
 DROPOUT = 0.1
@@ -107,9 +107,9 @@ STATE_EMB_DIM = 2
 # -------------------------------------------------------------------------
 # Optuna ist ein Tool, welches zur gezielten Suche der optimalen Hyperparameterkonfiguration genutzt werden kann. 
 # Der Suchraum der Parameter wird in der Funktion 'suggest_hyperparameters' bestimmt.
-USE_OPTUNA = False  # Für die Suche der besten Hyperparameter True, für finale Runs mit festgelegten Parametern False
+USE_OPTUNA = True  # Für die Suche der besten Hyperparameter True, für finale Runs mit festgelegten Parametern False
 OPTUNA_TRIALS = None # verschiedene Kombinationen an Parametern
-OPTUNA_TIMEOUT_SEC = 54000
+OPTUNA_TIMEOUT_SEC = 43200
 OPTUNA_SEEDS_PER_TRIAL = 1 # Jede Parameterkombination wird mit defefinierter Anzahl zufällig im Lösungsraum gestartet, Analog zu NUM_SEEDS
 OPTUNA_DIRECTION = "minimize"  # Lossvalue von val_mase minimieren
 
@@ -558,7 +558,7 @@ def suggest_hyperparameters(optuna_trial: optuna.Trial) -> dict:
     # Die Parameter Grenzen für Optuna festlegen, in denen nach der optimalen Kombination gesucht wird
     suggested_hyperparameters = {
         "learning_rate": optuna_trial.suggest_float("learning_rate", 1e-4, 5e-3, log=True),
-        "hidden_size": optuna_trial.suggest_categorical("hidden_size", [64, 128]),
+        "hidden_size": optuna_trial.suggest_categorical("hidden_size", [128,256]),
         "num_layers": optuna_trial.suggest_categorical("num_layers", [2, 3]),
         "dropout": optuna_trial.suggest_float("dropout", 0.0, 0.3),
     }
@@ -645,6 +645,25 @@ def reorder_metrics_columns(metrics_dataframe: pd.DataFrame) -> pd.DataFrame:
     return metrics_dataframe[existing_columns + remaining_columns]
 
 
+def count_parameters(model: nn.Module) -> dict:
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    # Aufschlüsselung nach Layer-Gruppen
+    breakdown = {}
+    for name, module in model.named_children():
+        params = sum(p.numel() for p in module.parameters())
+        breakdown[name] = params
+    
+    return {
+        "total": total,
+        "trainable": trainable,
+        "non_trainable": total - trainable,
+        "breakdown": breakdown,
+    }
+
+
+
 def train_one_seed(
     df: pd.DataFrame,
     feature_cols_enc: list,
@@ -719,6 +738,12 @@ def train_one_seed(
         num_layers=num_layers,
         dropout=dropout_rate
     ).to(DEVICE)
+
+    # Parameter zählen und loggen
+    param_info = count_parameters(model)
+    print(f"Trainierbare Parameter: {param_info['trainable']:,}")
+    print(f"Gesamt Parameter:       {param_info['total']:,}")
+    print(f"Aufschlüsselung:        {param_info['breakdown']}")
 
     # Optimizer, Loss-Funktion und Scheduler Setup.
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
