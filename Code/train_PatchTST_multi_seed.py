@@ -51,15 +51,14 @@ MAX_SERIES = 1000
 ENCODER_LEN = 56
 PRED_LEN = 28
 HORIZON = PRED_LEN
-MAX_EPOCHS = 5
-
+MAX_EPOCHS = 25
 
 # -----------------------------------------------------------------------------
 # Modell-Hyperparameter
 # -----------------------------------------------------------------------------
 BATCH_SIZE = 1024
 LR = 5e-3
-D_MODEL = 128
+D_MODEL = 256
 ATTN_HEAD_SIZE = 4
 HIDDEN_CONT_SIZE = int(D_MODEL/2)
 DROPOUT = 0.1
@@ -80,7 +79,7 @@ LR_MIN = 1e-6           # Untergrenze
 # -----------------------------------------------------------------------------
 USE_OPTUNA = True
 OPTUNA_TRIALS = None
-OPTUNA_TIMEOUT_SEC = 54000
+OPTUNA_TIMEOUT_SEC = 43200
 OPTUNA_SEEDS_PER_TRIAL = 1
 OPTUNA_DIRECTION = "minimize"
 
@@ -653,7 +652,6 @@ def suggest_hyperparameters(optuna_trial: optuna.Trial) -> dict:
         "attention_head_size": optuna_trial.suggest_categorical("attention_head_size", [2, 4]),
         "dropout": optuna_trial.suggest_float("dropout", 0.0, 0.3),
         "num_transformer_layers": optuna_trial.suggest_categorical("num_transformer_layers", [2, 3]), # wie viele Transformer-Blöcke gestapelt werden. 
-        "batch_size": optuna_trial.suggest_categorical("batch_size", [1024, 2048]),
     }
 
 
@@ -739,7 +737,6 @@ def train_one_seed(
         attention_head_size = int(hpo_params.get("attention_head_size", attention_head_size))
         hidden_continuous_size = int(d_model / 2)
         dropout_rate = float(hpo_params.get("dropout", dropout_rate))
-        batch_size = int(hpo_params.get("batch_size", batch_size))
         num_transformer_layers = int(hpo_params.get("num_transformer_layers", num_transformer_layers))
 
     set_seed(seed_value)
@@ -853,8 +850,8 @@ def train_one_seed(
         callbacks=[ckpt, early, lr_monitor],
         log_every_n_steps=70,
         enable_progress_bar=True,
-        enable_model_summary=False,
-        profiler=None,
+        enable_model_summary=True,
+        profiler="simple",
     )
 
     total_start = time.perf_counter()
