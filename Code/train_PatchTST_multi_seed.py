@@ -45,41 +45,42 @@ DEVICE = "gpu" if torch.cuda.is_available() else "cpu"
 TORCH_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 BASE_SEED = 1
-NUM_SEEDS = 1
-MAX_SERIES = 200
+NUM_SEEDS = 3
+MAX_SERIES = 1000
 
 ENCODER_LEN = 56
 PRED_LEN = 28
 HORIZON = PRED_LEN
-MAX_EPOCHS = 2
+MAX_EPOCHS = 5
 
 
 # -----------------------------------------------------------------------------
 # Modell-Hyperparameter
 # -----------------------------------------------------------------------------
-BATCH_SIZE = 4096
+BATCH_SIZE = 1024
 LR = 5e-3
-HIDDEN_SIZE = 32
+D_MODEL = 128
 ATTN_HEAD_SIZE = 4
-HIDDEN_CONT_SIZE = 16
+HIDDEN_CONT_SIZE = int(D_MODEL/2)
 DROPOUT = 0.1
 
 PATCH_LEN = 16
-PATCH_STRIDE = 2
+PATCH_STRIDE = 8
 NUM_TRANSFORMER_LAYERS = 3
 SERIES_EMB_DIM = 16 # Anzahl der Embeding Features
 
-LR_PATIENCE = 1
-PATIENCE = 3
+LR_PATIENCE = 3
+PATIENCE = 6
 MIN_DELTA = 0.001
+LR_MIN = 1e-6           # Untergrenze
 
 
 # -----------------------------------------------------------------------------
 # Optuna
 # -----------------------------------------------------------------------------
-USE_OPTUNA = False
-OPTUNA_TRIALS = 1
-OPTUNA_TIMEOUT_SEC = None
+USE_OPTUNA = True
+OPTUNA_TRIALS = None
+OPTUNA_TIMEOUT_SEC = 54000
 OPTUNA_SEEDS_PER_TRIAL = 1
 OPTUNA_DIRECTION = "minimize"
 
@@ -320,23 +321,23 @@ def move_batch_to_device(batch, device):
 
 
 class PatchTSTEncoderBlock(nn.Module):
-    def __init__(self, hidden_size: int, attention_head_size: int, dropout: float, ff_hidden_size: int):
+    def __init__(self, d_model: int, attention_head_size: int, dropout: float, ff_d_model: int):
         super().__init__()
         self.self_attention = nn.MultiheadAttention(
-            embed_dim=hidden_size,
+            embed_dim=d_model,
             num_heads=attention_head_size,
             dropout=dropout,
             batch_first=True,
         )
         self.dropout = nn.Dropout(dropout)
-        self.norm_1 = nn.LayerNorm(hidden_size)
+        self.norm_1 = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
-            nn.Linear(hidden_size, ff_hidden_size),
+            nn.Linear(d_model, ff_d_model),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(ff_hidden_size, hidden_size),
+            nn.Linear(ff_d_model, d_model),
         )
-        self.norm_2 = nn.LayerNorm(hidden_size)
+        self.norm_2 = nn.LayerNorm(d_model)
 
     def forward(self, hidden_states: torch.Tensor):
         attention_output, attention_weights = self.self_attention(
@@ -360,7 +361,7 @@ class PatchTSTModel(pl.LightningModule):
         horizon: int,
         num_series: int,
         learning_rate: float,
-        hidden_size: int,
+        d_model: int,
         attention_head_size: int,
         hidden_continuous_size: int,
         dropout: float,
@@ -380,7 +381,7 @@ class PatchTSTModel(pl.LightningModule):
         self.horizon = int(horizon)
         self.num_series = int(num_series)
         self.learning_rate = float(learning_rate)
-        self.hidden_size = int(hidden_size)
+        self.d_model = int(d_model)
         self.attention_head_size = int(attention_head_size)
         self.hidden_continuous_size = int(hidden_continuous_size)
         self.dropout_rate = float(dropout)
@@ -397,25 +398,25 @@ class PatchTSTModel(pl.LightningModule):
 
         self.series_embedding = nn.Embedding(self.num_series + 1, self.series_emb_dim)
         self.input_norm = nn.LayerNorm(self.input_dim)
-        self.patch_projection = nn.Linear(self.patch_len * (self.input_dim + self.series_emb_dim), self.hidden_size)
-        self.positional_embedding = nn.Parameter(torch.randn(1, 256, self.hidden_size) * 0.02)
+        self.patch_projection = nn.Linear(self.patch_len * (self.input_dim + self.series_emb_dim), self.d_model)
+        self.positional_embedding = nn.Parameter(torch.randn(1, 256, self.d_model) * 0.02)
         self.encoder_blocks = nn.ModuleList(
             [
                 PatchTSTEncoderBlock(
-                    hidden_size=self.hidden_size,
+                    d_model=self.d_model,
                     attention_head_size=self.attention_head_size,
                     dropout=self.dropout_rate,
-                    ff_hidden_size=max(self.hidden_continuous_size, self.hidden_size * 2),
+                    ff_d_model=max(self.hidden_continuous_size, self.d_model * 2),
                 )
                 for _ in range(self.num_transformer_layers)
             ]
         )
-        self.encoder_norm = nn.LayerNorm(self.hidden_size)
+        self.encoder_norm = nn.LayerNorm(self.d_model)
         self.output_head = nn.Sequential(
-            nn.Linear(self.hidden_size, self.hidden_size),
+            nn.Linear(self.d_model, self.d_model),
             nn.GELU(),
             nn.Dropout(self.dropout_rate),
-            nn.Linear(self.hidden_size, self.horizon * self.num_quantiles),
+            nn.Linear(self.d_model, self.horizon * self.num_quantiles),
         )
 
         self._val_pred_batches = []
@@ -564,7 +565,7 @@ class PatchTSTModel(pl.LightningModule):
             patience=LR_PATIENCE,
             threshold=MIN_DELTA,
             threshold_mode="abs",
-            min_lr=1e-6,
+            min_lr=LR_MIN,
         )
 
         return {
@@ -648,13 +649,10 @@ def build_timeseries_datasets(df: pd.DataFrame):
 def suggest_hyperparameters(optuna_trial: optuna.Trial) -> dict:
     return {
         "learning_rate": optuna_trial.suggest_float("learning_rate", 1e-4, 5e-3, log=True),
-        "hidden_size": optuna_trial.suggest_categorical("hidden_size", [32, 64]),
-        "attention_head_size": optuna_trial.suggest_categorical("attention_head_size", [1, 2, 4]),
-        "hidden_continuous_size": optuna_trial.suggest_categorical("hidden_continuous_size", [32, 64, 128]),
+        "d_model": optuna_trial.suggest_categorical("d_model", [128,256]),
+        "attention_head_size": optuna_trial.suggest_categorical("attention_head_size", [2, 4]),
         "dropout": optuna_trial.suggest_float("dropout", 0.0, 0.3),
-        "patch_len": optuna_trial.suggest_categorical("patch_len", [4, 8, 16]), # größer = generischer, kleiner = genauer (rechenintensiver)
-        "patch_stride": optuna_trial.suggest_categorical("patch_stride", [2, 4, 8]), # wie weit das Fenster beim Erzeugen des nächsten Patches weiterspringt. In Kombination mit patch_len entstehen unterscheidlich enge Patch-Raster.
-        "num_transformer_layers": optuna_trial.suggest_categorical("num_transformer_layers", [2, 3, 4]), # wie viele Transformer-Blöcke gestapelt werden. 
+        "num_transformer_layers": optuna_trial.suggest_categorical("num_transformer_layers", [2, 3]), # wie viele Transformer-Blöcke gestapelt werden. 
         "batch_size": optuna_trial.suggest_categorical("batch_size", [1024, 2048]),
     }
 
@@ -726,7 +724,7 @@ def train_one_seed(
     hpo_params: dict | None = None,
 ) -> dict:
     learning_rate = LR
-    hidden_size = HIDDEN_SIZE
+    d_model = D_MODEL
     attention_head_size = ATTN_HEAD_SIZE
     hidden_continuous_size = HIDDEN_CONT_SIZE
     dropout_rate = DROPOUT
@@ -737,13 +735,11 @@ def train_one_seed(
 
     if hpo_params is not None:
         learning_rate = float(hpo_params.get("learning_rate", learning_rate))
-        hidden_size = int(hpo_params.get("hidden_size", hidden_size))
+        d_model = int(hpo_params.get("d_model", d_model))
         attention_head_size = int(hpo_params.get("attention_head_size", attention_head_size))
-        hidden_continuous_size = int(hpo_params.get("hidden_continuous_size", hidden_continuous_size))
+        hidden_continuous_size = int(d_model / 2)
         dropout_rate = float(hpo_params.get("dropout", dropout_rate))
         batch_size = int(hpo_params.get("batch_size", batch_size))
-        patch_len = int(hpo_params.get("patch_len", patch_len))
-        patch_stride = int(hpo_params.get("patch_stride", patch_stride))
         num_transformer_layers = int(hpo_params.get("num_transformer_layers", num_transformer_layers))
 
     set_seed(seed_value)
@@ -754,7 +750,7 @@ def train_one_seed(
         "pred_len": PRED_LEN,
         "batch_size": batch_size,
         "lr": learning_rate,
-        "hidden_size": hidden_size,
+        "d_model": d_model,
         "attn_head_size": attention_head_size,
         "hidden_cont_size": hidden_continuous_size,
         "dropout": dropout_rate,
@@ -787,22 +783,22 @@ def train_one_seed(
     train_loader = training_ds.to_dataloader(
         train=True,
         batch_size=batch_size,
-        num_workers=1,
-        persistent_workers=True,
+        num_workers=6,
+        persistent_workers=False,
         pin_memory=(TORCH_DEVICE == "cuda"),
     )
     val_loader = val_ds.to_dataloader(
         train=False,
         batch_size=batch_size,
-        num_workers=1,
-        persistent_workers=True,
+        num_workers=6,
+        persistent_workers=False,
         pin_memory=(TORCH_DEVICE == "cuda"),
     )
     # test_loader = test_ds.to_dataloader(
     #     train=False,
     #     batch_size=batch_size,
-    #     num_workers=1,
-    #     persistent_workers=True,
+    #     num_workers=6,
+    #     persistent_workers=False,
     #     pin_memory=(TORCH_DEVICE == "cuda"),
     # )
 
@@ -815,7 +811,7 @@ def train_one_seed(
         horizon=PRED_LEN,
         num_series=num_series,
         learning_rate=learning_rate,
-        hidden_size=hidden_size,
+        d_model=d_model,
         attention_head_size=attention_head_size,
         hidden_continuous_size=hidden_continuous_size,
         dropout=dropout_rate,
@@ -873,7 +869,7 @@ def train_one_seed(
             horizon=PRED_LEN,
             num_series=num_series,
             learning_rate=learning_rate,
-            hidden_size=hidden_size,
+            d_model=d_model,
             attention_head_size=attention_head_size,
             hidden_continuous_size=hidden_continuous_size,
             dropout=dropout_rate,
@@ -1111,7 +1107,7 @@ def main():
         "pred_len": PRED_LEN,
         "batch_size": BATCH_SIZE,
         "lr": LR,
-        "hidden_size": HIDDEN_SIZE,
+        "d_model": D_MODEL,
         "attn_head_size": ATTN_HEAD_SIZE,
         "hidden_cont_size": HIDDEN_CONT_SIZE,
         "dropout": DROPOUT,
