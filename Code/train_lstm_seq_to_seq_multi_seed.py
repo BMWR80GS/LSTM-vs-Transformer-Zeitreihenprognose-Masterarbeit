@@ -52,7 +52,7 @@ NUM_SEEDS = 1 # Wichtig: Wenn Optuna eingeschaltet ist und damit bereits Optuna 
 #Für die finalen Runs mit den Hyperparametern wird Optuna ausgeschaltet und dann kann hier NUM_SEEDS wieder zb. auf 3 gestellt werden.
 
 # Wird nur zur Dokumentation genutzt. Anzahl der Serien wird durch Subset bestimmt.
-MAX_SERIES = 200
+MAX_SERIES = 1000
 
 # Input und Output Sequenzlänge. Modell sieht 56 Tage der Vergangenheit und erstellt eine Prognose für die folgenden 28 Tage
 SEQ_LEN = 56
