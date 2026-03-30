@@ -57,9 +57,9 @@ MAX_EPOCHS = 25
 # -----------------------------------------------------------------------------
 BATCH_SIZE = 1024
 LR = 5e-3
-HIDDEN_SIZE = 64
+HIDDEN_SIZE = 32
 ATTN_HEAD_SIZE = 4
-HIDDEN_CONT_SIZE = 64
+HIDDEN_CONT_SIZE = HIDDEN_SIZE
 DROPOUT = 0.1
 
 LR_PATIENCE = 3
@@ -72,8 +72,8 @@ LR_MIN = 1e-6      # Untergrenze, für LR-Scheduler
 # Optuna
 # -----------------------------------------------------------------------------
 USE_OPTUNA = True
-OPTUNA_TRIALS = None # wird nicht mit fester Anzahl Trials verglichen, sondern jedes Modell bekommt eine definierte Trainingszeit. Hier 15 Stunden pro Modell
-OPTUNA_TIMEOUT_SEC = 54000
+OPTUNA_TRIALS = None # wird nicht mit fester Anzahl Trials verglichen, sondern jedes Modell bekommt eine definierte Trainingszeit. Hier 12 Stunden pro Modell
+OPTUNA_TIMEOUT_SEC = 43200
 OPTUNA_SEEDS_PER_TRIAL = 1
 OPTUNA_DIRECTION = "minimize"
 
