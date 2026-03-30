@@ -44,12 +44,12 @@ TORCH_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 BASE_SEED = 1
 NUM_SEEDS = 1
-MAX_SERIES = 200
+MAX_SERIES = 1000
 
 ENCODER_LEN = 56
 PRED_LEN = 28
 HORIZON = PRED_LEN
-MAX_EPOCHS = 15
+MAX_EPOCHS = 25
 
 
 # -----------------------------------------------------------------------------
@@ -57,22 +57,23 @@ MAX_EPOCHS = 15
 # -----------------------------------------------------------------------------
 BATCH_SIZE = 1024
 LR = 5e-3
-HIDDEN_SIZE = 32
+HIDDEN_SIZE = 64
 ATTN_HEAD_SIZE = 4
-HIDDEN_CONT_SIZE = 16
+HIDDEN_CONT_SIZE = 64
 DROPOUT = 0.1
 
-LR_PATIENCE = 1
+LR_PATIENCE = 3
 LR_Factor = 0.5
-PATIENCE = 4
+PATIENCE = 6
 MIN_DELTA = 0.001
+LR_MIN = 1e-6      # Untergrenze, für LR-Scheduler
 
 # -----------------------------------------------------------------------------
 # Optuna
 # -----------------------------------------------------------------------------
 USE_OPTUNA = True
-OPTUNA_TRIALS = 3
-OPTUNA_TIMEOUT_SEC = None
+OPTUNA_TRIALS = None # wird nicht mit fester Anzahl Trials verglichen, sondern jedes Modell bekommt eine definierte Trainingszeit. Hier 15 Stunden pro Modell
+OPTUNA_TIMEOUT_SEC = 54000
 OPTUNA_SEEDS_PER_TRIAL = 1
 OPTUNA_DIRECTION = "minimize"
 
@@ -378,7 +379,7 @@ class TFT_Model(TemporalFusionTransformer):
             patience=LR_PATIENCE,
             threshold=MIN_DELTA,
             threshold_mode="abs", # Absolute Veränderung zur vorherigen Epoche von MIN_DELTA
-            min_lr=1e-6, # sehr kleine LR als MIN LR gewählt
+            min_lr=LR_MIN,
         )
 
         return {
@@ -626,11 +627,9 @@ def build_timeseries_datasets(df: pd.DataFrame):
 def suggest_hyperparameters(optuna_trial: optuna.Trial) -> dict:
     return {
         "learning_rate": optuna_trial.suggest_float("learning_rate", 1e-4, 5e-3, log=True),
-        "hidden_size": optuna_trial.suggest_categorical("hidden_size", [16, 32]),
-        "attention_head_size": optuna_trial.suggest_categorical("attention_head_size", [1, 2, 4]),
-        "hidden_continuous_size": optuna_trial.suggest_categorical("hidden_continuous_size", [8, 16]),
+        "hidden_size": optuna_trial.suggest_categorical("hidden_size", [32, 64]),
+        "attention_head_size": optuna_trial.suggest_categorical("attention_head_size", [2, 4]),
         "dropout": optuna_trial.suggest_float("dropout", 0.0, 0.3),
-        "batch_size": optuna_trial.suggest_categorical("batch_size", [1024, 2048]),
     }
 
 
@@ -668,19 +667,15 @@ def train_one_seed(
     learning_rate = LR
     hidden_size = HIDDEN_SIZE
     attention_head_size = ATTN_HEAD_SIZE
-    hidden_continuous_size = HIDDEN_CONT_SIZE
     dropout_rate = DROPOUT
-    batch_size = BATCH_SIZE
-
-    print('learning_rate: ', learning_rate)
+    hidden_continuous_size = HIDDEN_CONT_SIZE
 
     if hpo_params is not None:
         learning_rate = float(hpo_params.get("learning_rate", learning_rate))
         hidden_size = int(hpo_params.get("hidden_size", hidden_size))
         attention_head_size = int(hpo_params.get("attention_head_size", attention_head_size))
-        hidden_continuous_size = int(hpo_params.get("hidden_continuous_size", hidden_continuous_size))
+        hidden_continuous_size = hidden_size
         dropout_rate = float(hpo_params.get("dropout", dropout_rate))
-        batch_size = int(hpo_params.get("batch_size", batch_size))
 
     set_seed(seed_value)
 
@@ -688,7 +683,7 @@ def train_one_seed(
         "model": "TFT",
         "encoder_len": ENCODER_LEN,
         "pred_len": PRED_LEN,
-        "batch_size": batch_size,
+        "batch_size": BATCH_SIZE,
         "lr": learning_rate,
         "hidden_size": hidden_size,
         "attn_head_size": attention_head_size,
@@ -716,23 +711,23 @@ def train_one_seed(
 
     train_loader = training_ds.to_dataloader(
         train=True,
-        batch_size=batch_size,
-        num_workers=1,
-        persistent_workers=True,
+        batch_size=BATCH_SIZE,
+        num_workers=6,
+        persistent_workers=False,
         pin_memory=(TORCH_DEVICE == "cuda"),
     )
     val_loader = val_ds.to_dataloader(
         train=False,
-        batch_size=batch_size,
-        num_workers=1,
-        persistent_workers=True,
+        batch_size=BATCH_SIZE,
+        num_workers=6,
+        persistent_workers=False,
         pin_memory=(TORCH_DEVICE == "cuda"),
     )
     # test_loader = test_ds.to_dataloader(
     #     train=False,
-    #     batch_size=batch_size,
-    #     num_workers=1,
-    #     persistent_workers=True,
+    #     batch_size=BATCH_SIZE
+    #     num_workers=6,
+    #     persistent_workers=False,
     #     pin_memory=(TORCH_DEVICE == "cuda"),
     # )
 
@@ -764,12 +759,6 @@ def train_one_seed(
         mode="min",
     )
 
-    # lr_scheduler_callback = ValMaseLRSchedulerCallback(
-    # patience=LR_PATIENCE,
-    # factor=LR_Factor,
-    # min_lr=1e-6,
-    # )
-
     trainer = pl.Trainer(
         max_epochs=MAX_EPOCHS,
         accelerator=DEVICE,
@@ -780,7 +769,7 @@ def train_one_seed(
         callbacks=[ckpt, early],
         log_every_n_steps=30,
         enable_progress_bar=True,
-        enable_model_summary=False,
+        enable_model_summary=True,
         profiler=None,
     )
 
@@ -1122,7 +1111,7 @@ def main():
 
         objective_function = objective_factory(df=df, mase_denoms=mase_denoms, optuna_base_dir=optuna_run_dir)
         optuna_study = optuna.create_study(direction=OPTUNA_DIRECTION)
-        optuna_study.optimize(objective_function, n_trials=OPTUNA_TRIALS, timeout=OPTUNA_TIMEOUT_SEC)
+        optuna_study.optimize(objective_function, timeout=OPTUNA_TIMEOUT_SEC)
 
         plot_optimization_history(optuna_study).write_html(optuna_run_dir / "optuna_optimization_history.html")
         plot_param_importances(optuna_study).write_html(optuna_run_dir / "optuna_param_importances.html")
