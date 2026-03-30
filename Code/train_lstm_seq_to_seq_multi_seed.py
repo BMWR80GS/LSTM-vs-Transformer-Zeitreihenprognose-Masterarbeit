@@ -976,7 +976,7 @@ def main():
 
         optuna_study = optuna.create_study(direction=OPTUNA_DIRECTION)
         # Optuna startet mit 0 statt 1, daher wird um eins hochgezählt
-        optuna_study.optimize(objective_function, n_trials=OPTUNA_TRIALS+1, timeout=OPTUNA_TIMEOUT_SEC)
+        optuna_study.optimize(objective_function, timeout=OPTUNA_TIMEOUT_SEC)
 
         # 1. Verlauf der Objective-Funktion
         fig1 = plot_optimization_history(optuna_study)
