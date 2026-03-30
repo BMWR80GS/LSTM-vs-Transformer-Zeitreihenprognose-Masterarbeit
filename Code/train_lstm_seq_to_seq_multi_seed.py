@@ -59,7 +59,7 @@ SEQ_LEN = 56
 HORIZON = 28
 
 # Anzahl der maximalen Traingsepochen pro Run (Seed). Wird ggf. durch PATIENCE (Early Stopping) vorher beendet.
-MAX_EPOCHS = 2
+MAX_EPOCHS = 25
 
 # Trainingsumfang definieren Ende
 # -----------------------------------------------------------------------------
@@ -69,13 +69,13 @@ MAX_EPOCHS = 2
 # Modell-Architektur Konfiguration Start
 
 # Batch Size: Wird so festgelegt, dass die GPU maximal ausgelastet wird um das Training zu beschleunigen.
-BATCH_SIZE = 6144
+BATCH_SIZE = 1024
 
 # Hidden Size: Anzahl der Einheiten (Neuronen) pro verstecktem Layer 
-HIDDEN_SIZE = 64
+HIDDEN_SIZE = 128
 
 # LAYER = Anzahl der LSTM-Layer.
-LAYER = 1
+LAYER = 2
 
 # DROPOUT = Dropout zwischen den LSTM-Layern (wirkt nur bei LAYER > 1).
 DROPOUT = 0.1
@@ -85,7 +85,7 @@ LR = 3e-3
 LR_SCHEDULER = "plateau"   # nur für Logging/Config
 LR_FACTOR = 0.5            # LR wird mit diesem Faktor multipliziert
 LR_PATIENCE = 3            # Epochen ohne Verbesserung bis Reduktion
-LR_MIN = 1e-5              # Untergrenze
+LR_MIN = 1e-6              # Untergrenze
 
 # Early Stopping Konfiguration
 # PATIENCE = Anzahl aufeinanderfolgender Epochen ohne Verbesserung.
@@ -108,8 +108,8 @@ STATE_EMB_DIM = 2
 # Optuna ist ein Tool, welches zur gezielten Suche der optimalen Hyperparameterkonfiguration genutzt werden kann. 
 # Der Suchraum der Parameter wird in der Funktion 'suggest_hyperparameters' bestimmt.
 USE_OPTUNA = False  # Für die Suche der besten Hyperparameter True, für finale Runs mit festgelegten Parametern False
-OPTUNA_TRIALS = 20 # verschiedene Kombinationen an Parametern
-OPTUNA_TIMEOUT_SEC = None
+OPTUNA_TRIALS = None # verschiedene Kombinationen an Parametern
+OPTUNA_TIMEOUT_SEC = 54000
 OPTUNA_SEEDS_PER_TRIAL = 1 # Jede Parameterkombination wird mit defefinierter Anzahl zufällig im Lösungsraum gestartet, Analog zu NUM_SEEDS
 OPTUNA_DIRECTION = "minimize"  # Lossvalue von val_mase minimieren
 
@@ -558,10 +558,9 @@ def suggest_hyperparameters(optuna_trial: optuna.Trial) -> dict:
     # Die Parameter Grenzen für Optuna festlegen, in denen nach der optimalen Kombination gesucht wird
     suggested_hyperparameters = {
         "learning_rate": optuna_trial.suggest_float("learning_rate", 1e-4, 5e-3, log=True),
-        "hidden_size": optuna_trial.suggest_categorical("hidden_size", [128, 256]),
-        "num_layers": optuna_trial.suggest_categorical("num_layers", [1, 2]),
+        "hidden_size": optuna_trial.suggest_categorical("hidden_size", [64, 128]),
+        "num_layers": optuna_trial.suggest_categorical("num_layers", [2, 3]),
         "dropout": optuna_trial.suggest_float("dropout", 0.0, 0.3),
-        "batch_size": optuna_trial.suggest_categorical("batch_size", [1024, 2048]),
     }
     return suggested_hyperparameters
 
@@ -678,7 +677,6 @@ def train_one_seed(
         hidden_size = int(hpo_params.get("hidden_size", hidden_size))
         num_layers = int(hpo_params.get("num_layers", num_layers))
         dropout_rate = float(hpo_params.get("dropout", dropout_rate))
-        batch_size = int(hpo_params.get("batch_size", batch_size))
 
     # Erzeugung der Sliding Windows über die Funktion build_windows.
     feature_values_enc_train, feature_values_dec_train, Y_log_train, Series_train, Item_train, Store_train, State_train = build_windows(df, "train", series_to_idx, feature_cols_enc, feature_cols_dec)
@@ -705,8 +703,8 @@ def train_one_seed(
     )
 
     # Aufbau von DataLoadern für Training und Validierung. Der Trainings-DataLoader wird mit shuffle=True erstellt, um die Reihenfolge der Samples in jedem Epochendurchlauf zu randomisieren, was zu einem robusteren Training führen soll.
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=6, persistent_workers=False)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=6, persistent_workers=False)
 
     # Modellinitialisierung.
     # Modell Init
@@ -991,7 +989,7 @@ def main():
 
             seed_summary = train_one_seed(
                 df=df,
-                feature_cols_enc=feature_cols_enc,
+                feature_cols_enc=feature_cols_dec,
                 feature_cols_dec=feature_cols_dec,
                 series_to_idx=series_to_idx,
                 idx_to_series=idx_to_series,
