@@ -59,7 +59,7 @@ SEQ_LEN = 56
 HORIZON = 28
 
 # Anzahl der maximalen Traingsepochen pro Run (Seed). Wird ggf. durch PATIENCE (Early Stopping) vorher beendet.
-MAX_EPOCHS = 20
+MAX_EPOCHS = 25
 
 # Trainingsumfang definieren Ende
 # -----------------------------------------------------------------------------
@@ -69,11 +69,11 @@ MAX_EPOCHS = 20
 # Modell-Architektur Konfiguration Start
 
 # Batch Size: Wird so festgelegt, dass die GPU maximal ausgelastet wird um das Training zu beschleunigen.
-BATCH_SIZE = 2048
+BATCH_SIZE = 1024
 
 
 # Hidden Size: Anzahl der Einheiten (Neuronen) pro verstecktem Layer 
-HIDDEN_SIZE = 256
+HIDDEN_SIZE = 128
 
 # LAYER = Anzahl der LSTM-Layer.
 LAYER = 2
@@ -86,7 +86,7 @@ LR = 3e-3
 LR_SCHEDULER = "plateau"   # nur für Logging/Config
 LR_FACTOR = 0.5            # LR wird mit diesem Faktor multipliziert
 LR_PATIENCE = 3            # Epochen ohne Verbesserung bis Reduktion
-LR_MIN = 1e-5              # Untergrenze
+LR_MIN = 1e-6             # Untergrenze
 
 # Early Stopping Konfiguration
 # PATIENCE = Anzahl aufeinanderfolgender Epochen ohne Verbesserung.
@@ -109,8 +109,8 @@ STATE_EMB_DIM = 2
 # Optuna ist ein Tool, welches zur gezielten Suche der optimalen Hyperparameterkonfiguration genutzt werden kann. 
 # Der Suchraum der Parameter wird in der Funktion 'suggest_hyperparameters' bestimmt.
 USE_OPTUNA = True  # Für die Suche der besten Hyperparameter True, für finale Runs mit festgelegten Parametern False
-OPTUNA_TRIALS = 20 # verschiedene Kombinationen an Parametern
-OPTUNA_TIMEOUT_SEC = None
+OPTUNA_TRIALS = None # wird nicht mit fester Anzahl Trials verglichen, sondern jedes Modell bekommt eine definierte Trainingszeit. Hier 15 Stunden pro Modell
+OPTUNA_TIMEOUT_SEC = 54000
 OPTUNA_SEEDS_PER_TRIAL = 1 # Jede Parameterkombination wird mit defefinierter Anzahl zufällig im Lösungsraum gestartet, Analog zu NUM_SEEDS
 OPTUNA_DIRECTION = "minimize"  # Lossvalue von val_mase minimieren
 
@@ -140,41 +140,6 @@ def load_preprocessed():
 
     return df
 
-
-# def add_autoregressive_features_from_yz(df: pd.DataFrame) -> pd.DataFrame:
-#     # Erzeugung autoregressiver Features aus y_log.
-#     #
-#     # Hintergrund:
-#     #   - Das Modell wird im log-space trainiert (y_log), da dies Ausreißer reduziert.
-#     #   - Für autoregressive Eingänge ist jedoch y_log vorteilhaft, da es pro Serie z-standardisiert ist
-#     #     und somit eine konsistentere Skala besitzt.
-#     #
-#     # Hinweis:
-#     #   Dieser Schritt ist bewusst im Trainingsskript enthalten, damit experimentell nachvollziehbar
-#     #   bleibt, welche Feature-Sets im jeweiligen Run genutzt wurden.
-
-#     df = df.copy()
-
-#     LAG_LIST = [7, 14, 28]
-#     ROLLING_WINDOWS = [7, 28]
-
-#     for lag in LAG_LIST:
-#         df[f"y_log_lag_{lag}"] = df.groupby("series_id")["y_log"].shift(lag)
-
-#     for w in ROLLING_WINDOWS:
-#         df[f"y_log_roll_mean_{w}"] = (
-#             df.groupby("series_id")["y_log"].shift(1).rolling(w).mean().reset_index(level=0, drop=True)
-#         )
-#         df[f"y_log_roll_std_{w}"] = (
-#             df.groupby("series_id")["y_log"].shift(1).rolling(w).std().reset_index(level=0, drop=True)
-#         )
-
-#     # Für die ersten Tage je Serie entstehen NaNs durch shift/rolling.
-#     # Diese werden mit 0 gefüllt, da die Eingänge z-standardisiert sind und 0 dem Serienmittel entspricht.
-#     fill_cols = [c for c in df.columns if c.startswith("y_log_lag_") or c.startswith("y_log_roll_")]
-#     df[fill_cols] = df[fill_cols].fillna(0.0).astype(np.float32)
-
-#     return df
 
 
 def build_feature_columns():
@@ -557,10 +522,10 @@ def suggest_hyperparameters(optuna_trial: optuna.Trial) -> dict:
     # Die Parameter Grenzen für Optuna festlegen, in denen nach der optimalen Kombination gesucht wird
     suggested_hyperparameters = {
         "learning_rate": optuna_trial.suggest_float("learning_rate", 1e-4, 5e-3, log=True),
-        "hidden_size": optuna_trial.suggest_categorical("hidden_size", [128, 256]),
-        "num_layers": optuna_trial.suggest_categorical("num_layers", [1, 2]),
+        "hidden_size": optuna_trial.suggest_categorical("hidden_size", [64, 128]),
+        "num_layers": optuna_trial.suggest_categorical("num_layers", [2, 3]),
         "dropout": optuna_trial.suggest_float("dropout", 0.0, 0.3),
-        "batch_size": optuna_trial.suggest_categorical("batch_size", [1024, 2048]),
+        #"batch_size": optuna_trial.suggest_categorical("batch_size", [1024, 2048]),
     }
     return suggested_hyperparameters
 
@@ -681,7 +646,6 @@ def train_one_seed(
         hidden_size = int(hpo_params.get("hidden_size", hidden_size))
         num_layers = int(hpo_params.get("num_layers", num_layers))
         dropout_rate = float(hpo_params.get("dropout", dropout_rate))
-        batch_size = int(hpo_params.get("batch_size", batch_size))
 
     # Erzeugung der Sliding Windows über die Funktion build_windows.
     Feature_train, Y_log_train, Series_train, Item_train, Store_train, State_train = build_windows(df, "train", series_to_idx, feature_cols)
@@ -706,8 +670,8 @@ def train_one_seed(
     )
 
     # Aufbau von DataLoadern für Training und Validierung. Der Trainings-DataLoader wird mit shuffle=True erstellt, um die Reihenfolge der Samples in jedem Epochendurchlauf zu randomisieren, was zu einem robusteren Training führen soll.
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=6, persistent_workers=False)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=6, persistent_workers=False)
 
     # Modellinitialisierung.
     n_features = Feature_train.shape[-1]
@@ -962,7 +926,7 @@ def main():
 
         optuna_study = optuna.create_study(direction=OPTUNA_DIRECTION)
         # Optuna startet mit 0 statt 1, daher wird um eins hochgezählt
-        optuna_study.optimize(objective_function, n_trials=OPTUNA_TRIALS+1, timeout=OPTUNA_TIMEOUT_SEC)
+        optuna_study.optimize(objective_function, timeout=OPTUNA_TIMEOUT_SEC)
 
         # 1. Verlauf der Objective-Funktion
         fig1 = plot_optimization_history(optuna_study)
