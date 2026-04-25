@@ -43,24 +43,24 @@ DEVICE = "gpu" if torch.cuda.is_available() else "cpu"
 TORCH_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 BASE_SEED = 1
-NUM_SEEDS = 1
+NUM_SEEDS = 3
 MAX_SERIES = 1000
 
 ENCODER_LEN = 56
 PRED_LEN = 28
 HORIZON = PRED_LEN
-MAX_EPOCHS = 25
+MAX_EPOCHS = 40
 
 
 # -----------------------------------------------------------------------------
 # Modell-Hyperparameter
 # -----------------------------------------------------------------------------
 BATCH_SIZE = 1024
-LR = 5e-3
+LR = 0.003433576737169772
 HIDDEN_SIZE = 32
-ATTN_HEAD_SIZE = 4
+ATTN_HEAD_SIZE = 2
 HIDDEN_CONT_SIZE = HIDDEN_SIZE
-DROPOUT = 0.1
+DROPOUT = 0.08563246298016265
 
 LR_PATIENCE = 3
 LR_Factor = 0.5
