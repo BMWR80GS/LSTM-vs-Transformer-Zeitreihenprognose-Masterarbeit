@@ -71,7 +71,7 @@ LR_MIN = 1e-6      # Untergrenze, für LR-Scheduler
 # -----------------------------------------------------------------------------
 # Optuna
 # -----------------------------------------------------------------------------
-USE_OPTUNA = True
+USE_OPTUNA = False
 OPTUNA_TRIALS = None # wird nicht mit fester Anzahl Trials verglichen, sondern jedes Modell bekommt eine definierte Trainingszeit. Hier 12 Stunden pro Modell
 OPTUNA_TIMEOUT_SEC = 43200
 OPTUNA_SEEDS_PER_TRIAL = 1
