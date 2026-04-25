@@ -51,17 +51,17 @@ MAX_SERIES = 1000
 ENCODER_LEN = 56
 PRED_LEN = 28
 HORIZON = PRED_LEN
-MAX_EPOCHS = 25
+MAX_EPOCHS = 40
 
 # -----------------------------------------------------------------------------
 # Modell-Hyperparameter
 # -----------------------------------------------------------------------------
 BATCH_SIZE = 1024
-LR = 5e-3
-D_MODEL = 256
-ATTN_HEAD_SIZE = 4
+LR = 0.0006559644071632867
+D_MODEL = 128
+ATTN_HEAD_SIZE = 2
 HIDDEN_CONT_SIZE = int(D_MODEL/2)
-DROPOUT = 0.1
+DROPOUT = 0.10827211824776498
 
 PATCH_LEN = 16
 PATCH_STRIDE = 8
@@ -69,7 +69,7 @@ NUM_TRANSFORMER_LAYERS = 3
 SERIES_EMB_DIM = 16 # Anzahl der Embeding Features
 
 LR_PATIENCE = 3
-PATIENCE = 6
+PATIENCE = 10
 MIN_DELTA = 0.001
 LR_MIN = 1e-6           # Untergrenze
 
@@ -77,7 +77,7 @@ LR_MIN = 1e-6           # Untergrenze
 # -----------------------------------------------------------------------------
 # Optuna
 # -----------------------------------------------------------------------------
-USE_OPTUNA = True
+USE_OPTUNA = False
 OPTUNA_TRIALS = None
 OPTUNA_TIMEOUT_SEC = 43200
 OPTUNA_SEEDS_PER_TRIAL = 1
